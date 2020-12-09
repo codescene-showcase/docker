@@ -10,13 +10,11 @@ import (
 	"testing"
 
 	containertypes "github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/container"
 	"github.com/docker/docker/daemon/config"
-	"github.com/docker/docker/oci"
-	"github.com/docker/docker/pkg/idtools"
-	"github.com/docker/docker/pkg/mount"
-	"github.com/gotestyourself/gotestyourself/assert"
-	is "github.com/gotestyourself/gotestyourself/assert/cmp"
+	"github.com/moby/sys/mount"
+	"github.com/moby/sys/mountinfo"
+	"gotest.tools/v3/assert"
+	is "gotest.tools/v3/assert/cmp"
 )
 
 const mountsFixture = `142 78 0:38 / / rw,relatime - aufs none rw,si=573b861da0b3a05b,dio
@@ -115,54 +113,6 @@ func TestNotCleanupMounts(t *testing.T) {
 	}
 }
 
-// TestTmpfsDevShmSizeOverride checks that user-specified /dev/tmpfs mount
-// size is not overriden by the default shmsize (that should only be used
-// for default /dev/shm (as in "shareable" and "private" ipc modes).
-// https://github.com/moby/moby/issues/35271
-func TestTmpfsDevShmSizeOverride(t *testing.T) {
-	size := "777m"
-	mnt := "/dev/shm"
-
-	d := Daemon{
-		idMappings: &idtools.IDMappings{},
-	}
-	c := &container.Container{
-		HostConfig: &containertypes.HostConfig{
-			ShmSize: 48 * 1024, // size we should NOT end up with
-		},
-	}
-	ms := []container.Mount{
-		{
-			Source:      "tmpfs",
-			Destination: mnt,
-			Data:        "size=" + size,
-		},
-	}
-
-	// convert ms to spec
-	spec := oci.DefaultSpec()
-	err := setMounts(&d, &spec, c, ms)
-	assert.Check(t, err)
-
-	// Check the resulting spec for the correct size
-	found := false
-	for _, m := range spec.Mounts {
-		if m.Destination == mnt {
-			for _, o := range m.Options {
-				if !strings.HasPrefix(o, "size=") {
-					continue
-				}
-				t.Logf("%+v\n", m.Options)
-				assert.Check(t, is.Equal("size="+size, o))
-				found = true
-			}
-		}
-	}
-	if !found {
-		t.Fatal("/dev/shm not found in spec, or size option missing")
-	}
-}
-
 func TestValidateContainerIsolationLinux(t *testing.T) {
 	d := Daemon{}
 
@@ -174,25 +124,25 @@ func TestShouldUnmountRoot(t *testing.T) {
 	for _, test := range []struct {
 		desc   string
 		root   string
-		info   *mount.Info
+		info   *mountinfo.Info
 		expect bool
 	}{
 		{
 			desc:   "root is at /",
 			root:   "/docker",
-			info:   &mount.Info{Root: "/docker", Mountpoint: "/docker"},
+			info:   &mountinfo.Info{Root: "/docker", Mountpoint: "/docker"},
 			expect: true,
 		},
 		{
 			desc:   "root is at in a submount from `/`",
 			root:   "/foo/docker",
-			info:   &mount.Info{Root: "/docker", Mountpoint: "/foo/docker"},
+			info:   &mountinfo.Info{Root: "/docker", Mountpoint: "/foo/docker"},
 			expect: true,
 		},
 		{
 			desc:   "root is mounted in from a parent mount namespace same root dir", // dind is an example of this
 			root:   "/docker",
-			info:   &mount.Info{Root: "/docker/volumes/1234657/_data", Mountpoint: "/docker"},
+			info:   &mountinfo.Info{Root: "/docker/volumes/1234657/_data", Mountpoint: "/docker"},
 			expect: false,
 		},
 	} {
@@ -223,39 +173,43 @@ func TestShouldUnmountRoot(t *testing.T) {
 
 func checkMounted(t *testing.T, p string, expect bool) {
 	t.Helper()
-	mounted, err := mount.Mounted(p)
+	mounted, err := mountinfo.Mounted(p)
 	assert.Check(t, err)
 	assert.Check(t, mounted == expect, "expected %v, actual %v", expect, mounted)
 }
 
 func TestRootMountCleanup(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Skip("root required")
+	}
+
 	t.Parallel()
 
 	testRoot, err := ioutil.TempDir("", t.Name())
-	assert.Assert(t, err)
+	assert.NilError(t, err)
 	defer os.RemoveAll(testRoot)
 	cfg := &config.Config{}
 
 	err = mount.MakePrivate(testRoot)
-	assert.Assert(t, err)
+	assert.NilError(t, err)
 	defer mount.Unmount(testRoot)
 
 	cfg.ExecRoot = filepath.Join(testRoot, "exec")
 	cfg.Root = filepath.Join(testRoot, "daemon")
 
 	err = os.Mkdir(cfg.ExecRoot, 0755)
-	assert.Assert(t, err)
+	assert.NilError(t, err)
 	err = os.Mkdir(cfg.Root, 0755)
-	assert.Assert(t, err)
+	assert.NilError(t, err)
 
 	d := &Daemon{configStore: cfg, root: cfg.Root}
 	unmountFile := getUnmountOnShutdownPath(cfg)
 
 	t.Run("regular dir no mountpoint", func(t *testing.T) {
 		err = setupDaemonRootPropagation(cfg)
-		assert.Assert(t, err)
+		assert.NilError(t, err)
 		_, err = os.Stat(unmountFile)
-		assert.Assert(t, err)
+		assert.NilError(t, err)
 		checkMounted(t, cfg.Root, true)
 
 		assert.Assert(t, d.cleanupMounts())
@@ -267,11 +221,11 @@ func TestRootMountCleanup(t *testing.T) {
 
 	t.Run("root is a private mountpoint", func(t *testing.T) {
 		err = mount.MakePrivate(cfg.Root)
-		assert.Assert(t, err)
+		assert.NilError(t, err)
 		defer mount.Unmount(cfg.Root)
 
 		err = setupDaemonRootPropagation(cfg)
-		assert.Assert(t, err)
+		assert.NilError(t, err)
 		assert.Check(t, ensureShared(cfg.Root))
 
 		_, err = os.Stat(unmountFile)
@@ -283,11 +237,11 @@ func TestRootMountCleanup(t *testing.T) {
 	// mount is pre-configured with a shared mount
 	t.Run("root is a shared mountpoint", func(t *testing.T) {
 		err = mount.MakeShared(cfg.Root)
-		assert.Assert(t, err)
+		assert.NilError(t, err)
 		defer mount.Unmount(cfg.Root)
 
 		err = setupDaemonRootPropagation(cfg)
-		assert.Assert(t, err)
+		assert.NilError(t, err)
 
 		if _, err := os.Stat(unmountFile); err == nil {
 			t.Fatal("unmount file should not exist")
@@ -301,13 +255,13 @@ func TestRootMountCleanup(t *testing.T) {
 	// does not need mount but unmount file exists from previous run
 	t.Run("old mount file is cleaned up on setup if not needed", func(t *testing.T) {
 		err = mount.MakeShared(testRoot)
-		assert.Assert(t, err)
+		assert.NilError(t, err)
 		defer mount.MakePrivate(testRoot)
 		err = ioutil.WriteFile(unmountFile, nil, 0644)
-		assert.Assert(t, err)
+		assert.NilError(t, err)
 
 		err = setupDaemonRootPropagation(cfg)
-		assert.Assert(t, err)
+		assert.NilError(t, err)
 
 		_, err = os.Stat(unmountFile)
 		assert.Check(t, os.IsNotExist(err), err)

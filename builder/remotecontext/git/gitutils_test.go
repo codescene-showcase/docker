@@ -14,37 +14,112 @@ import (
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
-	"github.com/gotestyourself/gotestyourself/assert"
-	is "github.com/gotestyourself/gotestyourself/assert/cmp"
+	"gotest.tools/v3/assert"
+	is "gotest.tools/v3/assert/cmp"
 )
 
 func TestParseRemoteURL(t *testing.T) {
-	dir, err := parseRemoteURL("git://github.com/user/repo.git")
-	assert.NilError(t, err)
-	assert.Check(t, is.DeepEqual(gitRepo{"git://github.com/user/repo.git", "master", ""}, dir, cmpGitRepoOpt))
+	tests := []struct {
+		doc      string
+		url      string
+		expected gitRepo
+	}{
+		{
+			doc: "git scheme uppercase, no url-fragment",
+			url: "GIT://github.com/user/repo.git",
+			expected: gitRepo{
+				remote: "git://github.com/user/repo.git",
+				ref:    "master",
+			},
+		},
+		{
+			doc: "git scheme, no url-fragment",
+			url: "git://github.com/user/repo.git",
+			expected: gitRepo{
+				remote: "git://github.com/user/repo.git",
+				ref:    "master",
+			},
+		},
+		{
+			doc: "git scheme, with url-fragment",
+			url: "git://github.com/user/repo.git#mybranch:mydir/mysubdir/",
+			expected: gitRepo{
+				remote: "git://github.com/user/repo.git",
+				ref:    "mybranch",
+				subdir: "mydir/mysubdir/",
+			},
+		},
+		{
+			doc: "https scheme, no url-fragment",
+			url: "https://github.com/user/repo.git",
+			expected: gitRepo{
+				remote: "https://github.com/user/repo.git",
+				ref:    "master",
+			},
+		},
+		{
+			doc: "https scheme, with url-fragment",
+			url: "https://github.com/user/repo.git#mybranch:mydir/mysubdir/",
+			expected: gitRepo{
+				remote: "https://github.com/user/repo.git",
+				ref:    "mybranch",
+				subdir: "mydir/mysubdir/",
+			},
+		},
+		{
+			doc: "git@, no url-fragment",
+			url: "git@github.com:user/repo.git",
+			expected: gitRepo{
+				remote: "git@github.com:user/repo.git",
+				ref:    "master",
+			},
+		},
+		{
+			doc: "git@, with url-fragment",
+			url: "git@github.com:user/repo.git#mybranch:mydir/mysubdir/",
+			expected: gitRepo{
+				remote: "git@github.com:user/repo.git",
+				ref:    "mybranch",
+				subdir: "mydir/mysubdir/",
+			},
+		},
+		{
+			doc: "ssh, no url-fragment",
+			url: "ssh://github.com/user/repo.git",
+			expected: gitRepo{
+				remote: "ssh://github.com/user/repo.git",
+				ref:    "master",
+			},
+		},
+		{
+			doc: "ssh, with url-fragment",
+			url: "ssh://github.com/user/repo.git#mybranch:mydir/mysubdir/",
+			expected: gitRepo{
+				remote: "ssh://github.com/user/repo.git",
+				ref:    "mybranch",
+				subdir: "mydir/mysubdir/",
+			},
+		},
+		{
+			doc: "ssh, with url-fragment and user",
+			url: "ssh://foo%40barcorp.com@github.com/user/repo.git#mybranch:mydir/mysubdir/",
+			expected: gitRepo{
+				remote: "ssh://foo%40barcorp.com@github.com/user/repo.git",
+				ref:    "mybranch",
+				subdir: "mydir/mysubdir/",
+			},
+		},
+	}
 
-	dir, err = parseRemoteURL("git://github.com/user/repo.git#mybranch:mydir/mysubdir/")
-	assert.NilError(t, err)
-	assert.Check(t, is.DeepEqual(gitRepo{"git://github.com/user/repo.git", "mybranch", "mydir/mysubdir/"}, dir, cmpGitRepoOpt))
-
-	dir, err = parseRemoteURL("https://github.com/user/repo.git")
-	assert.NilError(t, err)
-	assert.Check(t, is.DeepEqual(gitRepo{"https://github.com/user/repo.git", "master", ""}, dir, cmpGitRepoOpt))
-
-	dir, err = parseRemoteURL("https://github.com/user/repo.git#mybranch:mydir/mysubdir/")
-	assert.NilError(t, err)
-	assert.Check(t, is.DeepEqual(gitRepo{"https://github.com/user/repo.git", "mybranch", "mydir/mysubdir/"}, dir, cmpGitRepoOpt))
-
-	dir, err = parseRemoteURL("git@github.com:user/repo.git")
-	assert.NilError(t, err)
-	assert.Check(t, is.DeepEqual(gitRepo{"git@github.com:user/repo.git", "master", ""}, dir, cmpGitRepoOpt))
-
-	dir, err = parseRemoteURL("git@github.com:user/repo.git#mybranch:mydir/mysubdir/")
-	assert.NilError(t, err)
-	assert.Check(t, is.DeepEqual(gitRepo{"git@github.com:user/repo.git", "mybranch", "mydir/mysubdir/"}, dir, cmpGitRepoOpt))
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.doc, func(t *testing.T) {
+			repo, err := parseRemoteURL(tc.url)
+			assert.NilError(t, err)
+			assert.Check(t, is.DeepEqual(tc.expected, repo, cmp.AllowUnexported(gitRepo{})))
+		})
+	}
 }
-
-var cmpGitRepoOpt = cmp.AllowUnexported(gitRepo{})
 
 func TestCloneArgsSmartHttp(t *testing.T) {
 	mux := http.NewServeMux()
@@ -59,7 +134,7 @@ func TestCloneArgsSmartHttp(t *testing.T) {
 	})
 
 	args := fetchArgs(serverURL.String(), "master")
-	exp := []string{"fetch", "--depth", "1", "origin", "master"}
+	exp := []string{"fetch", "--depth", "1", "origin", "--", "master"}
 	assert.Check(t, is.DeepEqual(exp, args))
 }
 
@@ -75,13 +150,13 @@ func TestCloneArgsDumbHttp(t *testing.T) {
 	})
 
 	args := fetchArgs(serverURL.String(), "master")
-	exp := []string{"fetch", "origin", "master"}
+	exp := []string{"fetch", "origin", "--", "master"}
 	assert.Check(t, is.DeepEqual(exp, args))
 }
 
 func TestCloneArgsGit(t *testing.T) {
 	args := fetchArgs("git://github.com/docker/docker", "master")
-	exp := []string{"fetch", "--depth", "1", "origin", "master"}
+	exp := []string{"fetch", "--depth", "1", "origin", "--", "master"}
 	assert.Check(t, is.DeepEqual(exp, args))
 }
 
@@ -274,5 +349,20 @@ func TestValidGitTransport(t *testing.T) {
 		if isGitTransport(url) {
 			t.Fatalf("%q should not be detected as valid Git prefix", url)
 		}
+	}
+}
+
+func TestGitInvalidRef(t *testing.T) {
+	gitUrls := []string{
+		"git://github.com/moby/moby#--foo bar",
+		"git@github.com/moby/moby#--upload-pack=sleep;:",
+		"git@g.com:a/b.git#-B",
+		"git@g.com:a/b.git#with space",
+	}
+
+	for _, url := range gitUrls {
+		_, err := Clone(url)
+		assert.Assert(t, err != nil)
+		assert.Check(t, is.Contains(strings.ToLower(err.Error()), "invalid refspec"))
 	}
 }

@@ -16,12 +16,13 @@ import (
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/dockerversion"
 	"github.com/docker/docker/registry"
-	"github.com/docker/go-connections/sockets"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
 
 // ImageTypes represents the schema2 config types for images
 var ImageTypes = []string{
 	schema2.MediaTypeImageConfig,
+	ocispec.MediaTypeImageConfig,
 	// Handle unexpected values from https://github.com/docker/distribution/issues/1621
 	// (see also https://github.com/docker/docker/issues/22378,
 	// https://github.com/docker/docker/issues/30083)
@@ -54,7 +55,10 @@ func init() {
 // NewV2Repository returns a repository (v2 only). It creates an HTTP transport
 // providing timeout settings and authentication support, and also verifies the
 // remote API version.
-func NewV2Repository(ctx context.Context, repoInfo *registry.RepositoryInfo, endpoint registry.APIEndpoint, metaHeaders http.Header, authConfig *types.AuthConfig, actions ...string) (repo distribution.Repository, foundVersion bool, err error) {
+func NewV2Repository(
+	ctx context.Context, repoInfo *registry.RepositoryInfo, endpoint registry.APIEndpoint,
+	metaHeaders http.Header, authConfig *types.AuthConfig, actions ...string,
+) (repo distribution.Repository, foundVersion bool, err error) {
 	repoName := repoInfo.Name.Name()
 	// If endpoint does not support CanonicalName, use the RemoteName instead
 	if endpoint.TrimHostname {
@@ -70,16 +74,11 @@ func NewV2Repository(ctx context.Context, repoInfo *registry.RepositoryInfo, end
 	// TODO(dmcgowan): Call close idle connections when complete, use keep alive
 	base := &http.Transport{
 		Proxy:               http.ProxyFromEnvironment,
-		Dial:                direct.Dial,
+		DialContext:         direct.DialContext,
 		TLSHandshakeTimeout: 10 * time.Second,
 		TLSClientConfig:     endpoint.TLSConfig,
 		// TODO(dmcgowan): Call close idle connections when complete and use keep alive
 		DisableKeepAlives: true,
-	}
-
-	proxyDialer, err := sockets.DialerFromEnvironment(direct)
-	if err == nil {
-		base.Dial = proxyDialer.Dial
 	}
 
 	modifiers := registry.Headers(dockerversion.DockerUserAgent(ctx), metaHeaders)

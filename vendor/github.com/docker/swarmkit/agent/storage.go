@@ -1,9 +1,9 @@
 package agent
 
 import (
-	"github.com/boltdb/bolt"
 	"github.com/docker/swarmkit/api"
 	"github.com/gogo/protobuf/proto"
+	bolt "go.etcd.io/bbolt"
 )
 
 // Layout:
@@ -131,7 +131,9 @@ func PutTask(tx *bolt.Tx, task *api.Task) error {
 
 // PutTaskStatus updates the status for the task with id.
 func PutTaskStatus(tx *bolt.Tx, id string, status *api.TaskStatus) error {
-	return withCreateTaskBucketIfNotExists(tx, id, func(bkt *bolt.Bucket) error {
+	// this used to be withCreateTaskBucketIfNotExists, but that could lead
+	// to weird race conditions, and was not necessary.
+	return withTaskBucket(tx, id, func(bkt *bolt.Bucket) error {
 		p, err := proto.Marshal(status)
 		if err != nil {
 			return err

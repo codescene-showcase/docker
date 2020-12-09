@@ -2,6 +2,7 @@ package restart
 
 import (
 	"container/list"
+	"context"
 	"errors"
 	"sync"
 	"time"
@@ -14,7 +15,6 @@ import (
 	"github.com/docker/swarmkit/manager/state"
 	"github.com/docker/swarmkit/manager/state/store"
 	gogotypes "github.com/gogo/protobuf/types"
-	"golang.org/x/net/context"
 )
 
 const defaultOldTaskTimeout = time.Minute
@@ -47,6 +47,20 @@ type delayedStart struct {
 	// waiter is set to true if the next restart is waiting for this delay
 	// to complete.
 	waiter bool
+}
+
+// SupervisorInterface is an interface implemented by the Supervisor. It exists
+// to make testing easier, by allowing the restart supervisor to be mocked or
+// faked where desired.
+type SupervisorInterface interface {
+	Restart(context.Context, store.Tx, *api.Cluster, *api.Service, api.Task) error
+	UpdatableTasksInSlot(context.Context, orchestrator.Slot, *api.Service) orchestrator.Slot
+	RecordRestartHistory(orchestrator.SlotTuple, *api.Task)
+	DelayStart(context.Context, store.Tx, *api.Task, string, time.Duration, bool) <-chan struct{}
+	StartNow(store.Tx, string) error
+	Cancel(string)
+	CancelAll()
+	ClearServiceHistory(string)
 }
 
 // Supervisor initiates and manages restarts. It's responsible for
@@ -121,7 +135,7 @@ func (r *Supervisor) Restart(ctx context.Context, tx store.Tx, cluster *api.Clus
 	// Sanity check: was the task shut down already by a separate call to
 	// Restart? If so, we must avoid restarting it, because this will create
 	// an extra task. This should never happen unless there is a bug.
-	if t.DesiredState > api.TaskStateRunning {
+	if t.DesiredState > api.TaskStateCompleted {
 		return errors.New("Restart called on task that was already shut down")
 	}
 
@@ -138,13 +152,19 @@ func (r *Supervisor) Restart(ctx context.Context, tx store.Tx, cluster *api.Clus
 
 	var restartTask *api.Task
 
-	if orchestrator.IsReplicatedService(service) {
+	if orchestrator.IsReplicatedService(service) || orchestrator.IsReplicatedJob(service) {
 		restartTask = orchestrator.NewTask(cluster, service, t.Slot, "")
-	} else if orchestrator.IsGlobalService(service) {
+	} else if orchestrator.IsGlobalService(service) || orchestrator.IsGlobalJob(service) {
 		restartTask = orchestrator.NewTask(cluster, service, 0, t.NodeID)
 	} else {
 		log.G(ctx).Error("service not supported by restart supervisor")
 		return nil
+	}
+
+	if orchestrator.IsReplicatedJob(service) || orchestrator.IsGlobalJob(service) {
+		restartTask.JobIteration = &api.Version{
+			Index: service.JobStatus.JobIteration.Index,
+		}
 	}
 
 	n := store.GetNode(tx, t.NodeID)
@@ -194,10 +214,28 @@ func (r *Supervisor) Restart(ctx context.Context, tx store.Tx, cluster *api.Clus
 // restart policy.
 func (r *Supervisor) shouldRestart(ctx context.Context, t *api.Task, service *api.Service) bool {
 	// TODO(aluzzardi): This function should not depend on `service`.
-	condition := orchestrator.RestartCondition(t)
-
-	if condition != api.RestartOnAny &&
-		(condition != api.RestartOnFailure || t.Status.State == api.TaskStateCompleted) {
+	// There are 3 possible restart policies.
+	switch orchestrator.RestartCondition(t) {
+	case api.RestartOnAny:
+		// we will be restarting, we just need to do a few more checks.
+		// however, if the task belongs to a job, then we will treat
+		// RestartOnAny the same as RestartOnFailure, as it would be
+		// nonsensical to restart completed jobs.
+		if orchestrator.IsReplicatedJob(service) || orchestrator.IsGlobalJob(service) {
+			// it'd be nice to put a fallthrough here, but we can't fallthrough
+			// from inside of an if statement.
+			if t.Status.State == api.TaskStateCompleted {
+				return false
+			}
+		}
+	case api.RestartOnFailure:
+		// we won't restart if the task is in TaskStateCompleted, as this is a
+		// not a failed state -- it indicates that the task exited with 0
+		if t.Status.State == api.TaskStateCompleted {
+			return false
+		}
+	case api.RestartOnNone:
+		// RestartOnNone means we just don't restart, ever
 		return false
 	}
 
@@ -490,7 +528,15 @@ func (r *Supervisor) StartNow(tx store.Tx, taskID string) error {
 	if t == nil || t.DesiredState >= api.TaskStateRunning {
 		return nil
 	}
-	t.DesiredState = api.TaskStateRunning
+
+	// only tasks belonging to jobs will have a JobIteration, so this can be
+	// used to distinguish whether this is a job task without looking at the
+	// service.
+	if t.JobIteration != nil {
+		t.DesiredState = api.TaskStateCompleted
+	} else {
+		t.DesiredState = api.TaskStateRunning
+	}
 	return store.UpdateTask(tx, t)
 }
 
@@ -508,20 +554,13 @@ func (r *Supervisor) Cancel(taskID string) {
 	<-delay.doneCh
 }
 
-// CancelAll aborts all pending restarts and waits for any instances of
-// StartNow that have already triggered to complete.
+// CancelAll aborts all pending restarts
 func (r *Supervisor) CancelAll() {
-	var cancelled []delayedStart
-
 	r.mu.Lock()
 	for _, delay := range r.delays {
 		delay.cancel()
 	}
 	r.mu.Unlock()
-
-	for _, delay := range cancelled {
-		<-delay.doneCh
-	}
 }
 
 // ClearServiceHistory forgets restart history related to a given service ID.

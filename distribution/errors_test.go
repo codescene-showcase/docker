@@ -7,7 +7,7 @@ import (
 	"testing"
 
 	"github.com/docker/distribution/registry/api/errcode"
-	"github.com/docker/distribution/registry/api/v2"
+	v2 "github.com/docker/distribution/registry/api/v2"
 	"github.com/docker/distribution/registry/client"
 )
 
@@ -48,7 +48,7 @@ func TestContinueOnError_NonMirrorEndpoint(t *testing.T) {
 }
 
 func TestContinueOnError_MirrorEndpoint(t *testing.T) {
-	errs := []error{}
+	var errs []error
 	errs = append(errs, alwaysContinue...)
 	errs = append(errs, continueFromMirrorEndpoint...)
 	for _, err := range errs {

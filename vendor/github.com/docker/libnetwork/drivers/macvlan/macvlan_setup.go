@@ -11,9 +11,7 @@ import (
 )
 
 const (
-	dummyPrefix      = "dm-" // macvlan prefix for dummy parent interface
-	macvlanKernelVer = 3     // minimum macvlan kernel support
-	macvlanMajorVer  = 9     // minimum macvlan major kernel support
+	dummyPrefix = "dm-" // macvlan prefix for dummy parent interface
 )
 
 // Create the macvlan slave specifying the source name
@@ -30,7 +28,7 @@ func createMacVlan(containerIfName, parent, macvlanMode string) (string, error) 
 	// Get the link for the master index (Example: the docker host eth iface)
 	parentLink, err := ns.NlHandle().LinkByName(parent)
 	if err != nil {
-		return "", fmt.Errorf("error occoured looking up the %s parent iface %s error: %s", macvlanType, parent, err)
+		return "", fmt.Errorf("error occurred looking up the %s parent iface %s error: %s", macvlanType, parent, err)
 	}
 	// Create a macvlan link
 	macvlan := &netlink.Macvlan{
@@ -173,7 +171,7 @@ func createDummyLink(dummyName, truncNetID string) error {
 	}
 	parentDummyLink, err := ns.NlHandle().LinkByName(dummyName)
 	if err != nil {
-		return fmt.Errorf("error occoured looking up the %s parent iface %s error: %s", macvlanType, dummyName, err)
+		return fmt.Errorf("error occurred looking up the %s parent iface %s error: %s", macvlanType, dummyName, err)
 	}
 	// bring the new netlink iface up
 	if err := ns.NlHandle().LinkSetUp(parentDummyLink); err != nil {

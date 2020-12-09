@@ -11,6 +11,7 @@ import (
 	timetypes "github.com/docker/docker/api/types/time"
 	"github.com/docker/docker/container"
 	"github.com/docker/docker/daemon/logger"
+	logcache "github.com/docker/docker/daemon/logger/loggerutils/cache"
 	"github.com/docker/docker/errdefs"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
@@ -22,7 +23,7 @@ import (
 //
 // if it returns nil, the config channel will be active and return log
 // messages until it runs out or the context is canceled.
-func (daemon *Daemon) ContainerLogs(ctx context.Context, containerName string, config *types.ContainerLogsOptions) (<-chan *backend.LogMessage, bool, error) {
+func (daemon *Daemon) ContainerLogs(ctx context.Context, containerName string, config *types.ContainerLogsOptions) (messages <-chan *backend.LogMessage, isTTY bool, retErr error) {
 	lg := logrus.WithFields(logrus.Fields{
 		"module":    "daemon",
 		"method":    "(*Daemon).ContainerLogs",
@@ -32,27 +33,29 @@ func (daemon *Daemon) ContainerLogs(ctx context.Context, containerName string, c
 	if !(config.ShowStdout || config.ShowStderr) {
 		return nil, false, errdefs.InvalidParameter(errors.New("You must choose at least one stream"))
 	}
-	container, err := daemon.GetContainer(containerName)
+	ctr, err := daemon.GetContainer(containerName)
 	if err != nil {
 		return nil, false, err
 	}
 
-	if container.RemovalInProgress || container.Dead {
+	if ctr.RemovalInProgress || ctr.Dead {
 		return nil, false, errdefs.Conflict(errors.New("can not get logs from container which is dead or marked for removal"))
 	}
 
-	if container.HostConfig.LogConfig.Type == "none" {
+	if ctr.HostConfig.LogConfig.Type == "none" {
 		return nil, false, logger.ErrReadLogsNotSupported{}
 	}
 
-	cLog, cLogCreated, err := daemon.getLogger(container)
+	cLog, cLogCreated, err := daemon.getLogger(ctr)
 	if err != nil {
 		return nil, false, err
 	}
 	if cLogCreated {
 		defer func() {
-			if err = cLog.Close(); err != nil {
-				logrus.Errorf("Error closing logger: %v", err)
+			if retErr != nil {
+				if err = cLog.Close(); err != nil {
+					logrus.Errorf("Error closing logger: %v", err)
+				}
 			}
 		}()
 	}
@@ -101,14 +104,23 @@ func (daemon *Daemon) ContainerLogs(ctx context.Context, containerName string, c
 	// this goroutine functions as a shim between the logger and the caller.
 	messageChan := make(chan *backend.LogMessage, 1)
 	go func() {
-		// set up some defers
-		defer logs.Close()
+		if cLogCreated {
+			defer func() {
+				if err = cLog.Close(); err != nil {
+					logrus.Errorf("Error closing logger: %v", err)
+				}
+			}()
+		}
+		// signal that the log reader is gone
+		defer logs.ConsumerGone()
 
 		// close the messages channel. closing is the only way to signal above
 		// that we're doing with logs (other than context cancel i guess).
 		defer close(messageChan)
 
 		lg.Debug("begin logs")
+		defer lg.Debugf("end logs (%v)", ctx.Err())
+
 		for {
 			select {
 			// i do not believe as the system is currently designed any error
@@ -123,14 +135,12 @@ func (daemon *Daemon) ContainerLogs(ctx context.Context, containerName string, c
 				}
 				return
 			case <-ctx.Done():
-				lg.Debugf("logs: end stream, ctx is done: %v", ctx.Err())
 				return
 			case msg, ok := <-logs.Msg:
 				// there is some kind of pool or ring buffer in the logger that
 				// produces these messages, and a possible future optimization
 				// might be to use that pool and reuse message objects
 				if !ok {
-					lg.Debug("end logs")
 					return
 				}
 				m := msg.AsLogMessage() // just a pointer conversion, does not copy data
@@ -147,7 +157,7 @@ func (daemon *Daemon) ContainerLogs(ctx context.Context, containerName string, c
 			}
 		}
 	}()
-	return messageChan, container.Config.Tty, nil
+	return messageChan, ctr.Config.Tty, nil
 }
 
 func (daemon *Daemon) getLogger(container *container.Container) (l logger.Logger, created bool, err error) {
@@ -181,6 +191,8 @@ func (daemon *Daemon) mergeAndVerifyLogConfig(cfg *containertypes.LogConfig) err
 		}
 	}
 
+	logcache.MergeDefaultLogConfig(cfg.Config, daemon.defaultLogConfig.Config)
+
 	return logger.ValidateLogOpts(cfg.Type, cfg.Config)
 }
 
@@ -195,6 +207,7 @@ func (daemon *Daemon) setupDefaultLogConfig() error {
 		Type:   config.LogConfig.Type,
 		Config: config.LogConfig.Config,
 	}
+
 	logrus.Debugf("Using default logging driver %s", daemon.defaultLogConfig.Type)
 	return nil
 }

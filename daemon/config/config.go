@@ -3,13 +3,12 @@ package config // import "github.com/docker/docker/daemon/config"
 import (
 	"bytes"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
+	"net"
 	"os"
 	"reflect"
-	"runtime"
 	"strings"
 	"sync"
 
@@ -19,6 +18,7 @@ import (
 	"github.com/docker/docker/pkg/discovery"
 	"github.com/docker/docker/registry"
 	"github.com/imdario/mergo"
+	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/pflag"
 )
@@ -32,9 +32,10 @@ const (
 	// maximum number of uploads that
 	// may take place at a time for each push.
 	DefaultMaxConcurrentUploads = 5
-	// StockRuntimeName is the reserved name/alias used to represent the
-	// OCI runtime being shipped with the docker daemon package.
-	StockRuntimeName = "runc"
+	// DefaultDownloadAttempts is the default value for
+	// maximum number of attempts that
+	// may take place at a time for each pull when the connection is lost.
+	DefaultDownloadAttempts = 5
 	// DefaultShmSize is the default value for container's shm size
 	DefaultShmSize = int64(67108864)
 	// DefaultNetworkMtu is the default value for network MTU
@@ -43,7 +44,23 @@ const (
 	DisableNetworkBridge = "none"
 	// DefaultInitBinary is the name of the default init binary
 	DefaultInitBinary = "docker-init"
+
+	// StockRuntimeName is the reserved name/alias used to represent the
+	// OCI runtime being shipped with the docker daemon package.
+	StockRuntimeName = "runc"
+	// LinuxV1RuntimeName is the runtime used to specify the containerd v1 shim with the runc binary
+	// Note this is different than io.containerd.runc.v1 which would be the v1 shim using the v2 shim API.
+	// This is specifically for the v1 shim using the v1 shim API.
+	LinuxV1RuntimeName = "io.containerd.runtime.v1.linux"
+	// LinuxV2RuntimeName is the runtime used to specify the containerd v2 runc shim
+	LinuxV2RuntimeName = "io.containerd.runc.v2"
 )
+
+var builtinRuntimes = map[string]bool{
+	StockRuntimeName:   true,
+	LinuxV1RuntimeName: true,
+	LinuxV2RuntimeName: true,
+}
 
 // flatOptions contains configuration keys
 // that MUST NOT be parsed as deep structures.
@@ -54,6 +71,28 @@ var flatOptions = map[string]bool{
 	"log-opts":           true,
 	"runtimes":           true,
 	"default-ulimits":    true,
+	"features":           true,
+	"builder":            true,
+}
+
+// skipValidateOptions contains configuration keys
+// that will be skipped from findConfigurationConflicts
+// for unknown flag validation.
+var skipValidateOptions = map[string]bool{
+	"features": true,
+	"builder":  true,
+	// Corresponding flag has been removed because it was already unusable
+	"deprecated-key-path": true,
+}
+
+// skipDuplicates contains configuration keys that
+// will be skipped when checking duplicated
+// configuration field defined in both daemon
+// config file and from dockerd cli flags.
+// This allows some configurations to be merged
+// during the parsing.
+var skipDuplicates = map[string]bool{
+	"runtimes": true,
 }
 
 // LogConfig represents the default log configuration.
@@ -75,6 +114,8 @@ type commonBridgeConfig struct {
 type NetworkConfig struct {
 	// Default address pools for docker networks
 	DefaultAddressPools opts.PoolsOpt `json:"default-address-pools,omitempty"`
+	// NetworkControlPlaneMTU allows to specify the control plane MTU, this will allow to optimize the network use in some components
+	NetworkControlPlaneMTU int `json:"network-control-plane-mtu,omitempty"`
 }
 
 // CommonTLSOptions defines TLS configuration for the daemon server.
@@ -84,6 +125,14 @@ type CommonTLSOptions struct {
 	CAFile   string `json:"tlscacert,omitempty"`
 	CertFile string `json:"tlscert,omitempty"`
 	KeyFile  string `json:"tlskey,omitempty"`
+}
+
+// DNSConfig defines the DNS configurations.
+type DNSConfig struct {
+	DNS           []string `json:"dns,omitempty"`
+	DNSOptions    []string `json:"dns-opts,omitempty"`
+	DNSSearch     []string `json:"dns-search,omitempty"`
+	HostGatewayIP net.IP   `json:"host-gateway-ip,omitempty"`
 }
 
 // CommonConfig defines the configuration of a docker daemon which is
@@ -96,9 +145,6 @@ type CommonConfig struct {
 	AutoRestart           bool                      `json:"-"`
 	Context               map[string][]string       `json:"-"`
 	DisableBridge         bool                      `json:"-"`
-	DNS                   []string                  `json:"dns,omitempty"`
-	DNSOptions            []string                  `json:"dns-opts,omitempty"`
-	DNSSearch             []string                  `json:"dns-search,omitempty"`
 	ExecOptions           []string                  `json:"exec-opts,omitempty"`
 	GraphDriver           string                    `json:"storage-driver,omitempty"`
 	GraphOptions          []string                  `json:"storage-opts,omitempty"`
@@ -126,15 +172,18 @@ type CommonConfig struct {
 	// ClusterStore is the storage backend used for the cluster information. It is used by both
 	// multihost networking (to store networks and endpoints information) and by the node discovery
 	// mechanism.
+	// Deprecated: host-discovery and overlay networks with external k/v stores are deprecated
 	ClusterStore string `json:"cluster-store,omitempty"`
 
 	// ClusterOpts is used to pass options to the discovery package for tuning libkv settings, such
 	// as TLS configuration settings.
+	// Deprecated: host-discovery and overlay networks with external k/v stores are deprecated
 	ClusterOpts map[string]string `json:"cluster-store-opts,omitempty"`
 
 	// ClusterAdvertise is the network endpoint that the Engine advertises for the purpose of node
 	// discovery. This should be a 'host:port' combination on which that daemon instance is
 	// reachable by other hosts.
+	// Deprecated: host-discovery and overlay networks with external k/v stores are deprecated
 	ClusterAdvertise string `json:"cluster-advertise,omitempty"`
 
 	// MaxConcurrentDownloads is the maximum number of downloads that
@@ -145,6 +194,10 @@ type CommonConfig struct {
 	// may take place at a time for each push.
 	MaxConcurrentUploads *int `json:"max-concurrent-uploads,omitempty"`
 
+	// MaxDownloadAttempts is the maximum number of attempts that
+	// may take place at a time for each push.
+	MaxDownloadAttempts *int `json:"max-download-attempts,omitempty"`
+
 	// ShutdownTimeout is the timeout value (in seconds) the daemon will wait for the container
 	// to stop when daemon is being shutdown
 	ShutdownTimeout int `json:"shutdown-timeout,omitempty"`
@@ -152,8 +205,8 @@ type CommonConfig struct {
 	Debug     bool     `json:"debug,omitempty"`
 	Hosts     []string `json:"hosts,omitempty"`
 	LogLevel  string   `json:"log-level,omitempty"`
-	TLS       bool     `json:"tls,omitempty"`
-	TLSVerify bool     `json:"tlsverify,omitempty"`
+	TLS       *bool    `json:"tls,omitempty"`
+	TLSVerify *bool    `json:"tlsverify,omitempty"`
 
 	// Embedded structs that allow config
 	// deserialization without the full struct.
@@ -177,6 +230,7 @@ type CommonConfig struct {
 
 	MetricsAddress string `json:"metrics-addr"`
 
+	DNSConfig
 	LogConfig
 	BridgeConfig // bridgeConfig holds bridge network specific configuration.
 	NetworkConfig
@@ -192,12 +246,24 @@ type CommonConfig struct {
 	// Exposed node Generic Resources
 	// e.g: ["orange=red", "orange=green", "orange=blue", "apple=3"]
 	NodeGenericResources []string `json:"node-generic-resources,omitempty"`
-	// NetworkControlPlaneMTU allows to specify the control plane MTU, this will allow to optimize the network use in some components
-	NetworkControlPlaneMTU int `json:"network-control-plane-mtu,omitempty"`
 
 	// ContainerAddr is the address used to connect to containerd if we're
 	// not starting it ourselves
 	ContainerdAddr string `json:"containerd,omitempty"`
+
+	// CriContainerd determines whether a supervised containerd instance
+	// should be configured with the CRI plugin enabled. This allows using
+	// Docker's containerd instance directly with a Kubernetes kubelet.
+	CriContainerd bool `json:"cri-containerd,omitempty"`
+
+	// Features contains a list of feature key value pairs indicating what features are enabled or disabled.
+	// If a certain feature doesn't appear in this list then it's unset (i.e. neither true nor false).
+	Features map[string]bool `json:"features,omitempty"`
+
+	Builder BuilderConfig `json:"builder,omitempty"`
+
+	ContainerdNamespace       string `json:"containerd-namespace,omitempty"`
+	ContainerdPluginNamespace string `json:"containerd-plugin-namespace,omitempty"`
 }
 
 // IsValueSet returns true if a configuration value
@@ -215,10 +281,6 @@ func New() *Config {
 	config := Config{}
 	config.LogConfig.Config = make(map[string]string)
 	config.ClusterOpts = make(map[string]string)
-
-	if runtime.GOOS != "linux" {
-		config.V2Only = true
-	}
 	return &config
 }
 
@@ -233,7 +295,7 @@ func ParseClusterAdvertiseSettings(clusterStore, clusterAdvertise string) (strin
 
 	advertise, err := discovery.ParseAdvertise(clusterAdvertise)
 	if err != nil {
-		return "", fmt.Errorf("discovery advertise parsing failed (%v)", err)
+		return "", errors.Wrap(err, "discovery advertise parsing failed")
 	}
 	return advertise, nil
 }
@@ -262,38 +324,19 @@ func GetConflictFreeLabels(labels []string) ([]string, error) {
 	return newLabels, nil
 }
 
-// ValidateReservedNamespaceLabels errors if the reserved namespaces com.docker.*,
-// io.docker.*, org.dockerproject.* are used in a configured engine label.
-//
-// TODO: This is a separate function because we need to warn users first of the
-// deprecation.  When we return an error, this logic can be added to Validate
-// or GetConflictFreeLabels instead of being here.
-func ValidateReservedNamespaceLabels(labels []string) error {
-	for _, label := range labels {
-		lowered := strings.ToLower(label)
-		if strings.HasPrefix(lowered, "com.docker.") || strings.HasPrefix(lowered, "io.docker.") ||
-			strings.HasPrefix(lowered, "org.dockerproject.") {
-			return fmt.Errorf(
-				"label %s not allowed: the namespaces com.docker.*, io.docker.*, and org.dockerproject.* are reserved for Docker's internal use",
-				label)
-		}
-	}
-	return nil
-}
-
 // Reload reads the configuration in the host and reloads the daemon and server.
 func Reload(configFile string, flags *pflag.FlagSet, reload func(*Config)) error {
 	logrus.Infof("Got signal to reload configuration, reloading from: %s", configFile)
 	newConfig, err := getConflictFreeConfiguration(configFile, flags)
 	if err != nil {
 		if flags.Changed("config-file") || !os.IsNotExist(err) {
-			return fmt.Errorf("unable to configure the Docker daemon with file %s: %v", configFile, err)
+			return errors.Wrapf(err, "unable to configure the Docker daemon with file %s", configFile)
 		}
 		newConfig = New()
 	}
 
 	if err := Validate(newConfig); err != nil {
-		return fmt.Errorf("file configuration validation failed (%v)", err)
+		return errors.Wrap(err, "file configuration validation failed")
 	}
 
 	// Check if duplicate label-keys with different values are found
@@ -324,7 +367,7 @@ func MergeDaemonConfigurations(flagsConfig *Config, flags *pflag.FlagSet, config
 	}
 
 	if err := Validate(fileConfig); err != nil {
-		return nil, fmt.Errorf("configuration validation from file failed (%v)", err)
+		return nil, errors.Wrap(err, "configuration validation from file failed")
 	}
 
 	// merge flags configuration on top of the file configuration
@@ -335,7 +378,7 @@ func MergeDaemonConfigurations(flagsConfig *Config, flags *pflag.FlagSet, config
 	// We need to validate again once both fileConfig and flagsConfig
 	// have been merged
 	if err := Validate(fileConfig); err != nil {
-		return nil, fmt.Errorf("merged configuration validation from file and command line flags failed (%v)", err)
+		return nil, errors.Wrap(err, "merged configuration validation from file and command line flags failed")
 	}
 
 	return fileConfig, nil
@@ -407,7 +450,7 @@ func getConflictFreeConfiguration(configFile string, flags *pflag.FlagSet) (*Con
 		logrus.Warn(`The "graph" config file option is deprecated. Please use "data-root" instead.`)
 
 		if config.Root != "" {
-			return nil, fmt.Errorf(`cannot specify both "graph" and "data-root" config file options`)
+			return nil, errors.New(`cannot specify both "graph" and "data-root" config file options`)
 		}
 
 		config.Root = config.RootDeprecated
@@ -439,7 +482,7 @@ func findConfigurationConflicts(config map[string]interface{}, flags *pflag.Flag
 	// 1. Search keys from the file that we don't recognize as flags.
 	unknownKeys := make(map[string]interface{})
 	for key, value := range config {
-		if flag := flags.Lookup(key); flag == nil {
+		if flag := flags.Lookup(key); flag == nil && !skipValidateOptions[key] {
 			unknownKeys[key] = value
 		}
 	}
@@ -449,9 +492,7 @@ func findConfigurationConflicts(config map[string]interface{}, flags *pflag.Flag
 	if len(unknownKeys) > 0 {
 		unknownNamedConflicts := func(f *pflag.Flag) {
 			if namedOption, ok := f.Value.(opts.NamedOption); ok {
-				if _, valid := unknownKeys[namedOption.Name()]; valid {
-					delete(unknownKeys, namedOption.Name())
-				}
+				delete(unknownKeys, namedOption.Name())
 			}
 		}
 		flags.VisitAll(unknownNamedConflicts)
@@ -474,13 +515,13 @@ func findConfigurationConflicts(config map[string]interface{}, flags *pflag.Flag
 	duplicatedConflicts := func(f *pflag.Flag) {
 		// search option name in the json configuration payload if the value is a named option
 		if namedOption, ok := f.Value.(opts.NamedOption); ok {
-			if optsValue, ok := config[namedOption.Name()]; ok {
+			if optsValue, ok := config[namedOption.Name()]; ok && !skipDuplicates[namedOption.Name()] {
 				conflicts = append(conflicts, printConflict(namedOption.Name(), f.Value.String(), optsValue))
 			}
 		} else {
 			// search flag name in the json configuration payload
 			for _, name := range []string{f.Name, f.Shorthand} {
-				if value, ok := config[name]; ok {
+				if value, ok := config[name]; ok && !skipDuplicates[name] {
 					conflicts = append(conflicts, printConflict(name, f.Value.String(), value))
 					break
 				}
@@ -498,7 +539,7 @@ func findConfigurationConflicts(config map[string]interface{}, flags *pflag.Flag
 
 // Validate validates some specific configs.
 // such as config.DNS, config.Labels, config.DNSSearch,
-// as well as config.MaxConcurrentDownloads, config.MaxConcurrentUploads.
+// as well as config.MaxConcurrentDownloads, config.MaxConcurrentUploads and config.MaxDownloadAttempts.
 func Validate(config *Config) error {
 	// validate DNS
 	for _, dns := range config.DNS {
@@ -528,6 +569,9 @@ func Validate(config *Config) error {
 	if config.MaxConcurrentUploads != nil && *config.MaxConcurrentUploads < 0 {
 		return fmt.Errorf("invalid max concurrent uploads: %d", *config.MaxConcurrentUploads)
 	}
+	if err := ValidateMaxDownloadAttempts(config); err != nil {
+		return err
+	}
 
 	// validate that "default" runtime is not reset
 	if runtimes := config.GetAllRuntimes(); len(runtimes) > 0 {
@@ -540,15 +584,25 @@ func Validate(config *Config) error {
 		return err
 	}
 
-	if defaultRuntime := config.GetDefaultRuntimeName(); defaultRuntime != "" && defaultRuntime != StockRuntimeName {
-		runtimes := config.GetAllRuntimes()
-		if _, ok := runtimes[defaultRuntime]; !ok {
-			return fmt.Errorf("specified default runtime '%s' does not exist", defaultRuntime)
+	if defaultRuntime := config.GetDefaultRuntimeName(); defaultRuntime != "" {
+		if !builtinRuntimes[defaultRuntime] {
+			runtimes := config.GetAllRuntimes()
+			if _, ok := runtimes[defaultRuntime]; !ok {
+				return fmt.Errorf("specified default runtime '%s' does not exist", defaultRuntime)
+			}
 		}
 	}
 
 	// validate platform-specific settings
 	return config.ValidatePlatformConfig()
+}
+
+// ValidateMaxDownloadAttempts validates if the max-download-attempts is within the valid range
+func ValidateMaxDownloadAttempts(config *Config) error {
+	if config.MaxDownloadAttempts != nil && *config.MaxDownloadAttempts <= 0 {
+		return fmt.Errorf("invalid max download attempts: %d", *config.MaxDownloadAttempts)
+	}
+	return nil
 }
 
 // ModifiedDiscoverySettings returns whether the discovery configuration has been modified or not.

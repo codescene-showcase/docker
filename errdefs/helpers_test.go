@@ -22,18 +22,24 @@ func TestNotFound(t *testing.T) {
 	if cause := e.(causal).Cause(); cause != errTest {
 		t.Fatalf("causual should be errTest, got: %v", cause)
 	}
+	if !errors.Is(e, errTest) {
+		t.Fatalf("expected not found error to match errTest")
+	}
 }
 
 func TestConflict(t *testing.T) {
 	if IsConflict(errTest) {
-		t.Fatalf("did not expect conflcit error, got %T", errTest)
+		t.Fatalf("did not expect conflict error, got %T", errTest)
 	}
 	e := Conflict(errTest)
 	if !IsConflict(e) {
-		t.Fatalf("expected conflcit error, got: %T", e)
+		t.Fatalf("expected conflict error, got: %T", e)
 	}
 	if cause := e.(causal).Cause(); cause != errTest {
 		t.Fatalf("causual should be errTest, got: %v", cause)
+	}
+	if !errors.Is(e, errTest) {
+		t.Fatalf("expected conflict error to match errTest")
 	}
 }
 
@@ -48,6 +54,9 @@ func TestForbidden(t *testing.T) {
 	if cause := e.(causal).Cause(); cause != errTest {
 		t.Fatalf("causual should be errTest, got: %v", cause)
 	}
+	if !errors.Is(e, errTest) {
+		t.Fatalf("expected forbidden error to match errTest")
+	}
 }
 
 func TestInvalidParameter(t *testing.T) {
@@ -60,6 +69,9 @@ func TestInvalidParameter(t *testing.T) {
 	}
 	if cause := e.(causal).Cause(); cause != errTest {
 		t.Fatalf("causual should be errTest, got: %v", cause)
+	}
+	if !errors.Is(e, errTest) {
+		t.Fatalf("expected invalid argument error to match errTest")
 	}
 }
 
@@ -74,6 +86,9 @@ func TestNotImplemented(t *testing.T) {
 	if cause := e.(causal).Cause(); cause != errTest {
 		t.Fatalf("causual should be errTest, got: %v", cause)
 	}
+	if !errors.Is(e, errTest) {
+		t.Fatalf("expected not implemented error to match errTest")
+	}
 }
 
 func TestNotModified(t *testing.T) {
@@ -87,18 +102,8 @@ func TestNotModified(t *testing.T) {
 	if cause := e.(causal).Cause(); cause != errTest {
 		t.Fatalf("causual should be errTest, got: %v", cause)
 	}
-}
-
-func TestAlreadyExists(t *testing.T) {
-	if IsAlreadyExists(errTest) {
-		t.Fatalf("did not expect already exists error, got %T", errTest)
-	}
-	e := AlreadyExists(errTest)
-	if !IsAlreadyExists(e) {
-		t.Fatalf("expected already exists error, got %T", e)
-	}
-	if cause := e.(causal).Cause(); cause != errTest {
-		t.Fatalf("causual should be errTest, got: %v", cause)
+	if !errors.Is(e, errTest) {
+		t.Fatalf("expected not modified error to match errTest")
 	}
 }
 
@@ -113,6 +118,9 @@ func TestUnauthorized(t *testing.T) {
 	if cause := e.(causal).Cause(); cause != errTest {
 		t.Fatalf("causual should be errTest, got: %v", cause)
 	}
+	if !errors.Is(e, errTest) {
+		t.Fatalf("expected unauthorized error to match errTest")
+	}
 }
 
 func TestUnknown(t *testing.T) {
@@ -125,6 +133,9 @@ func TestUnknown(t *testing.T) {
 	}
 	if cause := e.(causal).Cause(); cause != errTest {
 		t.Fatalf("causual should be errTest, got: %v", cause)
+	}
+	if !errors.Is(e, errTest) {
+		t.Fatalf("expected unknown error to match errTest")
 	}
 }
 
@@ -139,6 +150,9 @@ func TestCancelled(t *testing.T) {
 	if cause := e.(causal).Cause(); cause != errTest {
 		t.Fatalf("causual should be errTest, got: %v", cause)
 	}
+	if !errors.Is(e, errTest) {
+		t.Fatalf("expected cancelled error to match errTest")
+	}
 }
 
 func TestDeadline(t *testing.T) {
@@ -151,6 +165,9 @@ func TestDeadline(t *testing.T) {
 	}
 	if cause := e.(causal).Cause(); cause != errTest {
 		t.Fatalf("causual should be errTest, got: %v", cause)
+	}
+	if !errors.Is(e, errTest) {
+		t.Fatalf("expected deadline error to match errTest")
 	}
 }
 
@@ -165,6 +182,9 @@ func TestDataLoss(t *testing.T) {
 	if cause := e.(causal).Cause(); cause != errTest {
 		t.Fatalf("causual should be errTest, got: %v", cause)
 	}
+	if !errors.Is(e, errTest) {
+		t.Fatalf("expected data loss error to match errTest")
+	}
 }
 
 func TestUnavailable(t *testing.T) {
@@ -178,6 +198,9 @@ func TestUnavailable(t *testing.T) {
 	if cause := e.(causal).Cause(); cause != errTest {
 		t.Fatalf("causual should be errTest, got: %v", cause)
 	}
+	if !errors.Is(e, errTest) {
+		t.Fatalf("expected unavaillable error to match errTest")
+	}
 }
 
 func TestSystem(t *testing.T) {
@@ -190,5 +213,8 @@ func TestSystem(t *testing.T) {
 	}
 	if cause := e.(causal).Cause(); cause != errTest {
 		t.Fatalf("causual should be errTest, got: %v", cause)
+	}
+	if !errors.Is(e, errTest) {
+		t.Fatalf("expected system error to match errTest")
 	}
 }

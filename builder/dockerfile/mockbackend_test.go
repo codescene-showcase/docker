@@ -28,7 +28,7 @@ func (m *MockBackend) ContainerAttachRaw(cID string, stdin io.ReadCloser, stdout
 	return nil
 }
 
-func (m *MockBackend) ContainerCreate(config types.ContainerCreateConfig) (container.ContainerCreateCreatedBody, error) {
+func (m *MockBackend) ContainerCreateIgnoreImagesArgsEscaped(config types.ContainerCreateConfig) (container.ContainerCreateCreatedBody, error) {
 	if m.containerCreateFunc != nil {
 		return m.containerCreateFunc(config)
 	}
@@ -82,7 +82,7 @@ func (m *MockBackend) MakeImageCache(cacheFrom []string) builder.ImageCache {
 }
 
 func (m *MockBackend) CreateImage(config []byte, parent string) (builder.Image, error) {
-	return nil, nil
+	return &mockImage{id: "test"}, nil
 }
 
 type mockImage struct {
@@ -104,7 +104,7 @@ func (i *mockImage) OperatingSystem() string {
 
 func (i *mockImage) MarshalJSON() ([]byte, error) {
 	type rawImage mockImage
-	return json.Marshal(rawImage(*i))
+	return json.Marshal(rawImage(*i)) //nolint:staticcheck
 }
 
 type mockImageCache struct {

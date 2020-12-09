@@ -8,9 +8,9 @@ import (
 	containertypes "github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/container"
 	"github.com/docker/docker/daemon/exec"
-	"github.com/gotestyourself/gotestyourself/assert"
 	"github.com/opencontainers/runc/libcontainer/apparmor"
-	"github.com/opencontainers/runtime-spec/specs-go"
+	specs "github.com/opencontainers/runtime-spec/specs-go"
+	"gotest.tools/v3/assert"
 )
 
 func TestExecSetPlatformOpt(t *testing.T) {
@@ -49,5 +49,5 @@ func TestExecSetPlatformOptPrivileged(t *testing.T) {
 	c.HostConfig = &containertypes.HostConfig{Privileged: true}
 	err = d.execSetPlatformOpt(c, ec, p)
 	assert.NilError(t, err)
-	assert.Equal(t, "unconfined", p.ApparmorProfile)
+	assert.Equal(t, unconfinedAppArmorProfile, p.ApparmorProfile)
 }

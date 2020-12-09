@@ -13,6 +13,7 @@ import (
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/filters"
 	volumetypes "github.com/docker/docker/api/types/volume"
+	"github.com/docker/docker/errdefs"
 )
 
 func TestVolumeListError(t *testing.T) {
@@ -21,8 +22,8 @@ func TestVolumeListError(t *testing.T) {
 	}
 
 	_, err := client.VolumeList(context.Background(), filters.NewArgs())
-	if err == nil || err.Error() != "Error response from daemon: Server error" {
-		t.Fatalf("expected a Server Error, got %v", err)
+	if !errdefs.IsSystem(err) {
+		t.Fatalf("expected a Server Error, got %[1]T: %[1]v", err)
 	}
 }
 
@@ -69,7 +70,7 @@ func TestVolumeList(t *testing.T) {
 				if actualFilters != listCase.expectedFilters {
 					return nil, fmt.Errorf("filters not set in URL query properly. Expected '%s', got %s", listCase.expectedFilters, actualFilters)
 				}
-				content, err := json.Marshal(volumetypes.VolumesListOKBody{
+				content, err := json.Marshal(volumetypes.VolumeListOKBody{
 					Volumes: []*types.Volume{
 						{
 							Name:   "volume",

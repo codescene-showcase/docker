@@ -11,7 +11,7 @@ import (
 	"github.com/docker/docker/api/types/swarm/runtime"
 	"github.com/docker/docker/errdefs"
 	"github.com/docker/docker/plugin"
-	"github.com/docker/docker/plugin/v2"
+	v2 "github.com/docker/docker/plugin/v2"
 	"github.com/docker/swarmkit/api"
 	"github.com/gogo/protobuf/proto"
 	"github.com/pkg/errors"
@@ -20,7 +20,7 @@ import (
 
 // Controller is the controller for the plugin backend.
 // Plugins are managed as a singleton object with a desired state (different from containers).
-// With the the plugin controller instead of having a strict create->start->stop->remove
+// With the plugin controller instead of having a strict create->start->stop->remove
 // task lifecycle like containers, we manage the desired state of the plugin and let
 // the plugin manager do what it already does and monitor the plugin.
 // We'll also end up with many tasks all pointing to the same plugin ID.
@@ -34,7 +34,6 @@ type Controller struct {
 
 	pluginID  string
 	serviceID string
-	taskID    string
 
 	// hook used to signal tests that `Wait()` is actually ready and waiting
 	signalWaitReady func()
@@ -122,7 +121,7 @@ func (p *Controller) Prepare(ctx context.Context) (err error) {
 		return p.backend.Upgrade(ctx, remote, p.spec.Name, nil, &authConfig, privs, ioutil.Discard)
 	}
 
-	if err := p.backend.Pull(ctx, remote, p.spec.Name, nil, &authConfig, privs, ioutil.Discard, plugin.WithSwarmService(p.serviceID)); err != nil {
+	if err := p.backend.Pull(ctx, remote, p.spec.Name, nil, &authConfig, privs, ioutil.Discard, plugin.WithSwarmService(p.serviceID), plugin.WithEnv(p.spec.Env)); err != nil {
 		return err
 	}
 	pl, err = p.backend.Get(p.spec.Name)
@@ -180,7 +179,7 @@ func (p *Controller) Wait(ctx context.Context) error {
 		case <-ctx.Done():
 			return ctx.Err()
 		case e := <-events:
-			p.logger.Debugf("got event %#T", e)
+			p.logger.Debugf("got event %T", e)
 
 			switch e.(type) {
 			case plugin.EventEnable:

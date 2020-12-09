@@ -6,23 +6,24 @@ import (
 
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/integration/internal/requirement"
-	"github.com/docker/docker/internal/test/request"
-	"github.com/gotestyourself/gotestyourself/assert"
-	is "github.com/gotestyourself/gotestyourself/assert/cmp"
-	"github.com/gotestyourself/gotestyourself/skip"
+	"gotest.tools/v3/assert"
+	is "gotest.tools/v3/assert/cmp"
+	"gotest.tools/v3/skip"
 )
 
 // Test case for GitHub 22244
 func TestLoginFailsWithBadCredentials(t *testing.T) {
-	skip.IfCondition(t, !requirement.HasHubConnectivity(t))
+	skip.If(t, !requirement.HasHubConnectivity(t))
 
-	client := request.NewAPIClient(t)
+	defer setupTest(t)()
+	client := testEnv.APIClient()
 
 	config := types.AuthConfig{
 		Username: "no-user",
 		Password: "no-password",
 	}
 	_, err := client.RegistryLogin(context.Background(), config)
-	expected := "Error response from daemon: Get https://registry-1.docker.io/v2/: unauthorized: incorrect username or password"
-	assert.Check(t, is.Error(err, expected))
+	assert.Assert(t, err != nil)
+	assert.Check(t, is.ErrorContains(err, "unauthorized: incorrect username or password"))
+	assert.Check(t, is.ErrorContains(err, "https://registry-1.docker.io/v2/"))
 }

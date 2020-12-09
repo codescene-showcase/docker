@@ -10,7 +10,7 @@ import (
 	"github.com/docker/docker/pkg/idtools"
 )
 
-func fixPermissions(source, destination string, rootIDs idtools.IDPair, overrideSkip bool) error {
+func fixPermissions(source, destination string, identity idtools.Identity, overrideSkip bool) error {
 	var (
 		skipChownRoot bool
 		err           error
@@ -25,7 +25,7 @@ func fixPermissions(source, destination string, rootIDs idtools.IDPair, override
 
 	// We Walk on the source rather than on the destination because we don't
 	// want to change permissions on things we haven't created or modified.
-	return filepath.Walk(source, func(fullpath string, info os.FileInfo, err error) error {
+	return filepath.Walk(source, func(fullpath string, _ os.FileInfo, _ error) error {
 		// Do not alter the walk root iff. it existed before, as it doesn't fall under
 		// the domain of "things we should chown".
 		if skipChownRoot && source == fullpath {
@@ -39,7 +39,7 @@ func fixPermissions(source, destination string, rootIDs idtools.IDPair, override
 		}
 
 		fullpath = filepath.Join(destination, cleaned)
-		return os.Lchown(fullpath, rootIDs.UID, rootIDs.GID)
+		return os.Lchown(fullpath, identity.UID, identity.GID)
 	})
 }
 

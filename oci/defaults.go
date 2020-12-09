@@ -4,31 +4,13 @@ import (
 	"os"
 	"runtime"
 
-	"github.com/opencontainers/runtime-spec/specs-go"
+	"github.com/docker/docker/oci/caps"
+	specs "github.com/opencontainers/runtime-spec/specs-go"
 )
 
 func iPtr(i int64) *int64        { return &i }
 func u32Ptr(i int64) *uint32     { u := uint32(i); return &u }
 func fmPtr(i int64) *os.FileMode { fm := os.FileMode(i); return &fm }
-
-func defaultCapabilities() []string {
-	return []string{
-		"CAP_CHOWN",
-		"CAP_DAC_OVERRIDE",
-		"CAP_FSETID",
-		"CAP_FOWNER",
-		"CAP_MKNOD",
-		"CAP_NET_RAW",
-		"CAP_SETGID",
-		"CAP_SETUID",
-		"CAP_SETFCAP",
-		"CAP_SETPCAP",
-		"CAP_NET_BIND_SERVICE",
-		"CAP_SYS_CHROOT",
-		"CAP_KILL",
-		"CAP_AUDIT_WRITE",
-	}
-}
 
 // DefaultSpec returns the default spec used by docker for the current Platform
 func DefaultSpec() specs.Spec {
@@ -59,10 +41,10 @@ func DefaultLinuxSpec() specs.Spec {
 		Version: specs.Version,
 		Process: &specs.Process{
 			Capabilities: &specs.LinuxCapabilities{
-				Bounding:    defaultCapabilities(),
-				Permitted:   defaultCapabilities(),
-				Inheritable: defaultCapabilities(),
-				Effective:   defaultCapabilities(),
+				Bounding:    caps.DefaultCapabilities(),
+				Permitted:   caps.DefaultCapabilities(),
+				Inheritable: caps.DefaultCapabilities(),
+				Effective:   caps.DefaultCapabilities(),
 			},
 		},
 		Root: &specs.Root{},
@@ -114,6 +96,8 @@ func DefaultLinuxSpec() specs.Spec {
 
 	s.Linux = &specs.Linux{
 		MaskedPaths: []string{
+			"/proc/asound",
+			"/proc/acpi",
 			"/proc/kcore",
 			"/proc/keys",
 			"/proc/latency_stats",
@@ -124,7 +108,6 @@ func DefaultLinuxSpec() specs.Spec {
 			"/sys/firmware",
 		},
 		ReadonlyPaths: []string{
-			"/proc/asound",
 			"/proc/bus",
 			"/proc/fs",
 			"/proc/irq",

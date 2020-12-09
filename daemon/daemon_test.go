@@ -13,14 +13,12 @@ import (
 	_ "github.com/docker/docker/pkg/discovery/memory"
 	"github.com/docker/docker/pkg/idtools"
 	"github.com/docker/docker/pkg/truncindex"
-	volumedrivers "github.com/docker/docker/volume/drivers"
-	"github.com/docker/docker/volume/local"
-	"github.com/docker/docker/volume/store"
+	volumesservice "github.com/docker/docker/volume/service"
 	"github.com/docker/go-connections/nat"
 	"github.com/docker/libnetwork"
-	"github.com/gotestyourself/gotestyourself/assert"
-	is "github.com/gotestyourself/gotestyourself/assert/cmp"
 	"github.com/pkg/errors"
+	"gotest.tools/v3/assert"
+	is "gotest.tools/v3/assert/cmp"
 )
 
 //
@@ -84,15 +82,15 @@ func TestGetContainer(t *testing.T) {
 	daemon.reserveName(c4.ID, c4.Name)
 	daemon.reserveName(c5.ID, c5.Name)
 
-	if container, _ := daemon.GetContainer("3cdbd1aa394fd68559fd1441d6eff2ab7c1e6363582c82febfaa8045df3bd8de"); container != c2 {
+	if ctr, _ := daemon.GetContainer("3cdbd1aa394fd68559fd1441d6eff2ab7c1e6363582c82febfaa8045df3bd8de"); ctr != c2 {
 		t.Fatal("Should explicitly match full container IDs")
 	}
 
-	if container, _ := daemon.GetContainer("75fb0b8009"); container != c4 {
+	if ctr, _ := daemon.GetContainer("75fb0b8009"); ctr != c4 {
 		t.Fatal("Should match a partial ID")
 	}
 
-	if container, _ := daemon.GetContainer("drunk_hawking"); container != c2 {
+	if ctr, _ := daemon.GetContainer("drunk_hawking"); ctr != c2 {
 		t.Fatal("Should match a full name")
 	}
 
@@ -101,7 +99,7 @@ func TestGetContainer(t *testing.T) {
 		t.Fatal("Should match a full name even though it collides with another container's ID")
 	}
 
-	if container, _ := daemon.GetContainer("d22d69a2b896"); container != c5 {
+	if ctr, _ := daemon.GetContainer("d22d69a2b896"); ctr != c5 {
 		t.Fatal("Should match a container where the provided prefix is an exact match to the its name, and is also a prefix for its ID")
 	}
 
@@ -120,18 +118,10 @@ func initDaemonWithVolumeStore(tmp string) (*Daemon, error) {
 		repository: tmp,
 		root:       tmp,
 	}
-	drivers := volumedrivers.NewStore(nil)
-	daemon.volumes, err = store.New(tmp, drivers)
+	daemon.volumes, err = volumesservice.NewVolumeService(tmp, nil, idtools.Identity{UID: 0, GID: 0}, daemon)
 	if err != nil {
 		return nil, err
 	}
-
-	volumesDriver, err := local.New(tmp, idtools.IDPair{UID: 0, GID: 0})
-	if err != nil {
-		return nil, err
-	}
-	drivers.Register(volumesDriver, volumesDriver.Name())
-
 	return daemon, nil
 }
 
@@ -153,6 +143,10 @@ func TestValidContainerNames(t *testing.T) {
 }
 
 func TestContainerInitDNS(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Skip("root required") // for chown
+	}
+
 	tmp, err := ioutil.TempDir("", "docker-container-test-")
 	if err != nil {
 		t.Fatal(err)
@@ -182,8 +176,8 @@ func TestContainerInitDNS(t *testing.T) {
 "UpdateDns":false,"Volumes":{},"VolumesRW":{},"AppliedVolumesFrom":null}`
 
 	// Container struct only used to retrieve path to config file
-	container := &container.Container{Root: containerPath}
-	configPath, err := container.ConfigPath()
+	ctr := &container.Container{Root: containerPath}
+	configPath, err := ctr.ConfigPath()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -196,7 +190,7 @@ func TestContainerInitDNS(t *testing.T) {
 "Devices":[],"NetworkMode":"bridge","IpcMode":"","PidMode":"","CapAdd":null,"CapDrop":null,"RestartPolicy":{"Name":"no","MaximumRetryCount":0},
 "SecurityOpt":null,"ReadonlyRootfs":false,"Ulimits":null,"LogConfig":{"Type":"","Config":null},"CgroupParent":""}`
 
-	hostConfigPath, err := container.HostConfigPath()
+	hostConfigPath, err := ctr.HostConfigPath()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -318,7 +312,8 @@ func TestValidateContainerIsolation(t *testing.T) {
 func TestFindNetworkErrorType(t *testing.T) {
 	d := Daemon{}
 	_, err := d.FindNetwork("fakeNet")
-	_, ok := errors.Cause(err).(libnetwork.ErrNoSuchNetwork)
+	var nsn libnetwork.ErrNoSuchNetwork
+	ok := errors.As(err, &nsn)
 	if !errdefs.IsNotFound(err) || !ok {
 		t.Error("The FindNetwork method MUST always return an error that implements the NotFound interface and is ErrNoSuchNetwork")
 	}

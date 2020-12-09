@@ -2,7 +2,6 @@ package plugins // import "github.com/docker/docker/pkg/plugins"
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -14,9 +13,9 @@ import (
 
 	"github.com/docker/docker/pkg/plugins/transport"
 	"github.com/docker/go-connections/tlsconfig"
-	"github.com/gotestyourself/gotestyourself/assert"
-	is "github.com/gotestyourself/gotestyourself/assert/cmp"
 	"github.com/pkg/errors"
+	"gotest.tools/v3/assert"
+	is "gotest.tools/v3/assert/cmp"
 )
 
 var (
@@ -71,7 +70,7 @@ func TestEchoInputOutput(t *testing.T) {
 	m := Manifest{[]string{"VolumeDriver", "NetworkDriver"}}
 
 	mux.HandleFunc("/Test.Echo", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != "POST" {
+		if r.Method != http.MethodPost {
 			t.Fatalf("Expected POST, got %s\n", r.Method)
 		}
 
@@ -186,7 +185,7 @@ func TestClientStream(t *testing.T) {
 	var output Manifest
 
 	mux.HandleFunc("/Test.Echo", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != "POST" {
+		if r.Method != http.MethodPost {
 			t.Fatalf("Expected POST, got %s", r.Method)
 		}
 
@@ -219,7 +218,7 @@ func TestClientSendFile(t *testing.T) {
 		t.Fatal(err)
 	}
 	mux.HandleFunc("/Test.Echo", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != "POST" {
+		if r.Method != http.MethodPost {
 			t.Fatalf("Expected POST, got %s\n", r.Method)
 		}
 
@@ -237,6 +236,10 @@ func TestClientSendFile(t *testing.T) {
 }
 
 func TestClientWithRequestTimeout(t *testing.T) {
+	type timeoutError interface {
+		Timeout() bool
+	}
+
 	timeout := 1 * time.Millisecond
 	testHandler := func(w http.ResponseWriter, r *http.Request) {
 		time.Sleep(timeout + 1*time.Millisecond)
@@ -250,13 +253,9 @@ func TestClientWithRequestTimeout(t *testing.T) {
 	_, err := client.callWithRetry("/Plugin.Hello", nil, false, WithRequestTimeout(timeout))
 	assert.Assert(t, is.ErrorContains(err, ""), "expected error")
 
-	err = errors.Cause(err)
-
-	switch e := err.(type) {
-	case *url.Error:
-		err = e.Err
-	}
-	assert.DeepEqual(t, context.DeadlineExceeded, err)
+	var tErr timeoutError
+	assert.Assert(t, errors.As(err, &tErr))
+	assert.Assert(t, tErr.Timeout())
 }
 
 type testRequestWrapper struct {
@@ -264,7 +263,7 @@ type testRequestWrapper struct {
 }
 
 func (w *testRequestWrapper) NewRequest(path string, data io.Reader) (*http.Request, error) {
-	req, err := http.NewRequest("POST", path, data)
+	req, err := http.NewRequest(http.MethodPost, path, data)
 	if err != nil {
 		return nil, err
 	}

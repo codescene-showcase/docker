@@ -10,10 +10,9 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/docker/docker/internal/testutil"
-	"github.com/gotestyourself/gotestyourself/assert"
-	is "github.com/gotestyourself/gotestyourself/assert/cmp"
 	digest "github.com/opencontainers/go-digest"
+	"gotest.tools/v3/assert"
+	is "gotest.tools/v3/assert/cmp"
 )
 
 func defaultFSStoreBackend(t *testing.T) (StoreBackend, func()) {
@@ -30,16 +29,14 @@ func TestFSGetInvalidData(t *testing.T) {
 	store, cleanup := defaultFSStoreBackend(t)
 	defer cleanup()
 
-	id, err := store.Set([]byte("foobar"))
+	dgst, err := store.Set([]byte("foobar"))
 	assert.Check(t, err)
-
-	dgst := digest.Digest(id)
 
 	err = ioutil.WriteFile(filepath.Join(store.(*fs).root, contentDirName, string(dgst.Algorithm()), dgst.Hex()), []byte("foobar2"), 0600)
 	assert.Check(t, err)
 
-	_, err = store.Get(id)
-	testutil.ErrorContains(t, err, "failed to verify")
+	_, err = store.Get(dgst)
+	assert.Check(t, is.ErrorContains(err, "failed to verify"))
 }
 
 func TestFSInvalidSet(t *testing.T) {
@@ -51,7 +48,7 @@ func TestFSInvalidSet(t *testing.T) {
 	assert.Check(t, err)
 
 	_, err = store.Set([]byte("foobar"))
-	testutil.ErrorContains(t, err, "failed to write digest data")
+	assert.Check(t, is.ErrorContains(err, "failed to write digest data"))
 }
 
 func TestFSInvalidRoot(t *testing.T) {
@@ -78,7 +75,7 @@ func TestFSInvalidRoot(t *testing.T) {
 		f.Close()
 
 		_, err = NewFSStoreBackend(root)
-		testutil.ErrorContains(t, err, "failed to create storage backend")
+		assert.Check(t, is.ErrorContains(err, "failed to create storage backend"))
 
 		os.RemoveAll(root)
 	}
@@ -116,14 +113,14 @@ func TestFSMetadataGetSet(t *testing.T) {
 	}
 
 	_, err = store.GetMetadata(id2, "tkey2")
-	testutil.ErrorContains(t, err, "failed to read metadata")
+	assert.Check(t, is.ErrorContains(err, "failed to read metadata"))
 
 	id3 := digest.FromBytes([]byte("baz"))
 	err = store.SetMetadata(id3, "tkey", []byte("tval"))
-	testutil.ErrorContains(t, err, "failed to get digest")
+	assert.Check(t, is.ErrorContains(err, "failed to get digest"))
 
 	_, err = store.GetMetadata(id3, "tkey")
-	testutil.ErrorContains(t, err, "failed to get digest")
+	assert.Check(t, is.ErrorContains(err, "failed to get digest"))
 }
 
 func TestFSInvalidWalker(t *testing.T) {
@@ -173,7 +170,7 @@ func TestFSGetSet(t *testing.T) {
 	})
 
 	for _, tc := range tcases {
-		id, err := store.Set([]byte(tc.input))
+		id, err := store.Set(tc.input)
 		assert.Check(t, err)
 		assert.Check(t, is.Equal(tc.expected, id))
 	}
@@ -191,7 +188,7 @@ func TestFSGetUnsetKey(t *testing.T) {
 
 	for _, key := range []digest.Digest{"foobar:abc", "sha256:abc", "sha256:c3ab8ff13720e8ad9047dd39466b3c8974e592c2fa383d4a3960714caef0c4f2a"} {
 		_, err := store.Get(key)
-		testutil.ErrorContains(t, err, "failed to get digest")
+		assert.Check(t, is.ErrorContains(err, "failed to get digest"))
 	}
 }
 
@@ -201,7 +198,7 @@ func TestFSGetEmptyData(t *testing.T) {
 
 	for _, emptyData := range [][]byte{nil, {}} {
 		_, err := store.Set(emptyData)
-		testutil.ErrorContains(t, err, "invalid empty data")
+		assert.Check(t, is.ErrorContains(err, "invalid empty data"))
 	}
 }
 
@@ -219,7 +216,7 @@ func TestFSDelete(t *testing.T) {
 	assert.Check(t, err)
 
 	_, err = store.Get(id)
-	testutil.ErrorContains(t, err, "failed to get digest")
+	assert.Check(t, is.ErrorContains(err, "failed to get digest"))
 
 	_, err = store.Get(id2)
 	assert.Check(t, err)
@@ -228,7 +225,7 @@ func TestFSDelete(t *testing.T) {
 	assert.Check(t, err)
 
 	_, err = store.Get(id2)
-	testutil.ErrorContains(t, err, "failed to get digest")
+	assert.Check(t, is.ErrorContains(err, "failed to get digest"))
 }
 
 func TestFSWalker(t *testing.T) {
@@ -267,5 +264,5 @@ func TestFSWalkerStopOnError(t *testing.T) {
 	err = store.Walk(func(id digest.Digest) error {
 		return errors.New("what")
 	})
-	testutil.ErrorContains(t, err, "what")
+	assert.Check(t, is.ErrorContains(err, "what"))
 }

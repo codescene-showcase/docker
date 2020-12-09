@@ -11,13 +11,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/gotestyourself/gotestyourself/assert"
-	is "github.com/gotestyourself/gotestyourself/assert/cmp"
+	"gotest.tools/v3/assert"
+	is "gotest.tools/v3/assert/cmp"
 )
 
 func TestPeerCertificateMarshalJSON(t *testing.T) {
 	template := &x509.Certificate{
-		IsCA: true,
+		IsCA:                  true,
 		BasicConstraintsValid: true,
 		SubjectKeyId:          []byte{1, 2, 3},
 		SerialNumber:          big.NewInt(1234),
@@ -46,7 +46,7 @@ func TestPeerCertificateMarshalJSON(t *testing.T) {
 
 	var certs = []*x509.Certificate{cert}
 	addr := "www.authz.com/auth"
-	req, err := http.NewRequest("GET", addr, nil)
+	req, err := http.NewRequest(http.MethodGet, addr, nil)
 	assert.NilError(t, err)
 
 	req.RequestURI = addr

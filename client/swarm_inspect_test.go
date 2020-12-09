@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/docker/docker/api/types/swarm"
+	"github.com/docker/docker/errdefs"
 )
 
 func TestSwarmInspectError(t *testing.T) {
@@ -19,8 +20,8 @@ func TestSwarmInspectError(t *testing.T) {
 	}
 
 	_, err := client.SwarmInspect(context.Background())
-	if err == nil || err.Error() != "Error response from daemon: Server error" {
-		t.Fatalf("expected a Server Error, got %v", err)
+	if !errdefs.IsSystem(err) {
+		t.Fatalf("expected a Server Error, got %[1]T: %[1]v", err)
 	}
 }
 

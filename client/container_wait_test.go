@@ -2,6 +2,7 @@ package client // import "github.com/docker/docker/client"
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
@@ -11,9 +12,8 @@ import (
 	"testing"
 	"time"
 
-	"context"
-
 	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/errdefs"
 )
 
 func TestContainerWaitError(t *testing.T) {
@@ -25,8 +25,8 @@ func TestContainerWaitError(t *testing.T) {
 	case result := <-resultC:
 		t.Fatalf("expected to not get a wait result, got %d", result.StatusCode)
 	case err := <-errC:
-		if err.Error() != "Error response from daemon: Server error" {
-			t.Fatalf("expected a Server Error, got %v", err)
+		if !errdefs.IsSystem(err) {
+			t.Fatalf("expected a Server Error, got %[1]T: %[1]v", err)
 		}
 	}
 }
@@ -66,7 +66,7 @@ func ExampleClient_ContainerWait_withTimeout() {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	client, _ := NewEnvClient()
+	client, _ := NewClientWithOpts(FromEnv)
 	_, errC := client.ContainerWait(ctx, "container_id", "")
 	if err := <-errC; err != nil {
 		log.Fatal(err)

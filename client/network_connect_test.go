@@ -12,6 +12,7 @@ import (
 
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/network"
+	"github.com/docker/docker/errdefs"
 )
 
 func TestNetworkConnectError(t *testing.T) {
@@ -20,8 +21,8 @@ func TestNetworkConnectError(t *testing.T) {
 	}
 
 	err := client.NetworkConnect(context.Background(), "network_id", "container_id", nil)
-	if err == nil || err.Error() != "Error response from daemon: Server error" {
-		t.Fatalf("expected a Server Error, got %v", err)
+	if !errdefs.IsSystem(err) {
+		t.Fatalf("expected a Server Error, got %[1]T: %[1]v", err)
 	}
 }
 
@@ -34,7 +35,7 @@ func TestNetworkConnectEmptyNilEndpointSettings(t *testing.T) {
 				return nil, fmt.Errorf("Expected URL '%s', got '%s'", expectedURL, req.URL)
 			}
 
-			if req.Method != "POST" {
+			if req.Method != http.MethodPost {
 				return nil, fmt.Errorf("expected POST method, got %s", req.Method)
 			}
 
@@ -73,7 +74,7 @@ func TestNetworkConnect(t *testing.T) {
 				return nil, fmt.Errorf("Expected URL '%s', got '%s'", expectedURL, req.URL)
 			}
 
-			if req.Method != "POST" {
+			if req.Method != http.MethodPost {
 				return nil, fmt.Errorf("expected POST method, got %s", req.Method)
 			}
 

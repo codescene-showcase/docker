@@ -21,14 +21,15 @@ import (
 	"encoding/binary"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
-	"github.com/boltdb/bolt"
 	"github.com/containerd/containerd/content"
 	"github.com/containerd/containerd/gc"
 	"github.com/containerd/containerd/log"
 	"github.com/containerd/containerd/snapshots"
 	"github.com/pkg/errors"
+	bolt "go.etcd.io/bbolt"
 )
 
 const (
@@ -43,8 +44,21 @@ const (
 	// dbVersion represents updates to the schema
 	// version which are additions and compatible with
 	// prior version of the same schema.
-	dbVersion = 1
+	dbVersion = 3
 )
+
+// DBOpt configures how we set up the DB
+type DBOpt func(*dbOptions)
+
+// WithPolicyIsolated isolates contents between namespaces
+func WithPolicyIsolated(o *dbOptions) {
+	o.shared = false
+}
+
+// dbOptions configure db options.
+type dbOptions struct {
+	shared bool
+}
 
 // DB represents a metadata database backed by a bolt
 // database. The database is fully namespaced and stores
@@ -62,29 +76,44 @@ type DB struct {
 	// sweep phases without preventing read transactions.
 	wlock sync.RWMutex
 
-	// dirty flags and lock keeps track of datastores which have had deletions
-	// since the last garbage collection. These datastores will will be garbage
-	// collected during the next garbage collection.
-	dirtyL  sync.Mutex
+	// dirty flag indicates that references have been removed which require
+	// a garbage collection to ensure the database is clean. This tracks
+	// the number of dirty operations. This should be updated and read
+	// atomically if outside of wlock.Lock.
+	dirty uint32
+
+	// dirtySS and dirtyCS flags keeps track of datastores which have had
+	// deletions since the last garbage collection. These datastores will
+	// be garbage collected during the next garbage collection. These
+	// should only be updated inside of a write transaction or wlock.Lock.
 	dirtySS map[string]struct{}
 	dirtyCS bool
 
 	// mutationCallbacks are called after each mutation with the flag
 	// set indicating whether any dirty flags are set
 	mutationCallbacks []func(bool)
+
+	dbopts dbOptions
 }
 
 // NewDB creates a new metadata database using the provided
 // bolt database, content store, and snapshotters.
-func NewDB(db *bolt.DB, cs content.Store, ss map[string]snapshots.Snapshotter) *DB {
+func NewDB(db *bolt.DB, cs content.Store, ss map[string]snapshots.Snapshotter, opts ...DBOpt) *DB {
 	m := &DB{
 		db:      db,
 		ss:      make(map[string]*snapshotter, len(ss)),
 		dirtySS: map[string]struct{}{},
+		dbopts: dbOptions{
+			shared: true,
+		},
+	}
+
+	for _, opt := range opts {
+		opt(&m.dbopts)
 	}
 
 	// Initialize data stores
-	m.cs = newContentStore(m, cs)
+	m.cs = newContentStore(m, m.dbopts.shared, cs)
 	for name, sn := range ss {
 		m.ss[name] = newSnapshotter(m, name, sn)
 	}
@@ -140,7 +169,7 @@ func (m *DB) Init(ctx context.Context) error {
 			}
 		}
 
-		// Previous version fo database found
+		// Previous version of database found
 		if schema != "v0" {
 			updates := migrations[i:]
 
@@ -154,7 +183,7 @@ func (m *DB) Init(ctx context.Context) error {
 				if err := m.migrate(tx); err != nil {
 					return errors.Wrapf(err, "failed to migrate to %s.%d", m.schema, m.version)
 				}
-				log.G(ctx).WithField("d", time.Now().Sub(t0)).Debugf("finished database migration to %s.%d", m.schema, m.version)
+				log.G(ctx).WithField("d", time.Since(t0)).Debugf("finished database migration to %s.%d", m.schema, m.version)
 			}
 		}
 
@@ -195,6 +224,15 @@ func (m *DB) Snapshotter(name string) snapshots.Snapshotter {
 	return sn
 }
 
+// Snapshotters returns all available snapshotters.
+func (m *DB) Snapshotters() map[string]snapshots.Snapshotter {
+	ss := make(map[string]snapshots.Snapshotter, len(m.ss))
+	for n, sn := range m.ss {
+		ss[n] = sn
+	}
+	return ss
+}
+
 // View runs a readonly transaction on the metadata store.
 func (m *DB) View(fn func(*bolt.Tx) error) error {
 	return m.db.View(fn)
@@ -206,12 +244,10 @@ func (m *DB) Update(fn func(*bolt.Tx) error) error {
 	defer m.wlock.RUnlock()
 	err := m.db.Update(fn)
 	if err == nil {
-		m.dirtyL.Lock()
-		dirty := m.dirtyCS || len(m.dirtySS) > 0
+		dirty := atomic.LoadUint32(&m.dirty) > 0
 		for _, fn := range m.mutationCallbacks {
 			fn(dirty)
 		}
-		m.dirtyL.Unlock()
 	}
 
 	return err
@@ -223,9 +259,9 @@ func (m *DB) Update(fn func(*bolt.Tx) error) error {
 // The callback function is an argument for whether a deletion has occurred
 // since the last garbage collection.
 func (m *DB) RegisterMutationCallback(fn func(bool)) {
-	m.dirtyL.Lock()
+	m.wlock.Lock()
 	m.mutationCallbacks = append(m.mutationCallbacks, fn)
-	m.dirtyL.Unlock()
+	m.wlock.Unlock()
 }
 
 // GCStats holds the duration for the different phases of the garbage collector
@@ -251,8 +287,6 @@ func (m *DB) GarbageCollect(ctx context.Context) (gc.Stats, error) {
 		return nil, err
 	}
 
-	m.dirtyL.Lock()
-
 	if err := m.db.Update(func(tx *bolt.Tx) error {
 		ctx, cancel := context.WithCancel(ctx)
 		defer cancel()
@@ -266,7 +300,7 @@ func (m *DB) GarbageCollect(ctx context.Context) (gc.Stats, error) {
 				if idx := strings.IndexRune(n.Key, '/'); idx > 0 {
 					m.dirtySS[n.Key[:idx]] = struct{}{}
 				}
-			} else if n.Type == ResourceContent {
+			} else if n.Type == ResourceContent || n.Type == ResourceIngest {
 				m.dirtyCS = true
 			}
 			return remove(ctx, tx, n)
@@ -278,13 +312,15 @@ func (m *DB) GarbageCollect(ctx context.Context) (gc.Stats, error) {
 
 		return nil
 	}); err != nil {
-		m.dirtyL.Unlock()
 		m.wlock.Unlock()
 		return nil, err
 	}
 
 	var stats GCStats
 	var wg sync.WaitGroup
+
+	// reset dirty, no need for atomic inside of wlock.Lock
+	m.dirty = 0
 
 	if len(m.dirtySS) > 0 {
 		var sl sync.Mutex
@@ -297,7 +333,7 @@ func (m *DB) GarbageCollect(ctx context.Context) (gc.Stats, error) {
 				m.cleanupSnapshotter(snapshotterName)
 
 				sl.Lock()
-				stats.SnapshotD[snapshotterName] = time.Now().Sub(st1)
+				stats.SnapshotD[snapshotterName] = time.Since(st1)
 				sl.Unlock()
 
 				wg.Done()
@@ -312,15 +348,13 @@ func (m *DB) GarbageCollect(ctx context.Context) (gc.Stats, error) {
 		go func() {
 			ct1 := time.Now()
 			m.cleanupContent()
-			stats.ContentD = time.Now().Sub(ct1)
+			stats.ContentD = time.Since(ct1)
 			wg.Done()
 		}()
 		m.dirtyCS = false
 	}
 
-	m.dirtyL.Unlock()
-
-	stats.MetaD = time.Now().Sub(t1)
+	stats.MetaD = time.Since(t1)
 	m.wlock.Unlock()
 
 	wg.Wait()

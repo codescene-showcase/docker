@@ -2,14 +2,16 @@ package v2 // import "github.com/docker/docker/plugin/v2"
 
 import (
 	"fmt"
+	"net"
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/pkg/plugingetter"
 	"github.com/docker/docker/pkg/plugins"
-	"github.com/opencontainers/go-digest"
+	digest "github.com/opencontainers/go-digest"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 )
 
@@ -23,10 +25,13 @@ type Plugin struct {
 
 	Config   digest.Digest
 	Blobsums []digest.Digest
+	Manifest digest.Digest
 
 	modifyRuntimeSpec func(*specs.Spec)
 
 	SwarmServiceID string
+	timeout        time.Duration
+	addr           net.Addr
 }
 
 const defaultPluginRuntimeDestination = "/run/docker/plugins"
@@ -50,6 +55,7 @@ func (p *Plugin) ScopedPath(s string) string {
 }
 
 // Client returns the plugin client.
+// Deprecated: use p.Addr() and manually create the client
 func (p *Plugin) Client() *plugins.Client {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
@@ -58,6 +64,7 @@ func (p *Plugin) Client() *plugins.Client {
 }
 
 // SetPClient set the plugin client.
+// Deprecated: Hardcoded plugin client is deprecated
 func (p *Plugin) SetPClient(client *plugins.Client) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -257,10 +264,49 @@ func (p *Plugin) Release() {
 	p.AddRefCount(plugingetter.Release)
 }
 
-// SetSpecOptModifier sets the function to use to modify the the generated
+// SetSpecOptModifier sets the function to use to modify the generated
 // runtime spec.
 func (p *Plugin) SetSpecOptModifier(f func(*specs.Spec)) {
 	p.mu.Lock()
 	p.modifyRuntimeSpec = f
 	p.mu.Unlock()
+}
+
+// Timeout gets the currently configured connection timeout.
+// This should be used when dialing the plugin.
+func (p *Plugin) Timeout() time.Duration {
+	p.mu.RLock()
+	t := p.timeout
+	p.mu.RUnlock()
+	return t
+}
+
+// SetTimeout sets the timeout to use for dialing.
+func (p *Plugin) SetTimeout(t time.Duration) {
+	p.mu.Lock()
+	p.timeout = t
+	p.mu.Unlock()
+}
+
+// Addr returns the net.Addr to use to connect to the plugin socket
+func (p *Plugin) Addr() net.Addr {
+	p.mu.RLock()
+	addr := p.addr
+	p.mu.RUnlock()
+	return addr
+}
+
+// SetAddr sets the plugin address which can be used for dialing the plugin.
+func (p *Plugin) SetAddr(addr net.Addr) {
+	p.mu.Lock()
+	p.addr = addr
+	p.mu.Unlock()
+}
+
+// Protocol is the protocol that should be used for interacting with the plugin.
+func (p *Plugin) Protocol() string {
+	if p.PluginObj.Config.Interface.ProtocolScheme != "" {
+		return p.PluginObj.Config.Interface.ProtocolScheme
+	}
+	return plugins.ProtocolSchemeHTTPV1
 }

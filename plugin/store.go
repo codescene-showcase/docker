@@ -8,7 +8,7 @@ import (
 	"github.com/docker/docker/errdefs"
 	"github.com/docker/docker/pkg/plugingetter"
 	"github.com/docker/docker/pkg/plugins"
-	"github.com/docker/docker/plugin/v2"
+	v2 "github.com/docker/docker/plugin/v2"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
@@ -18,13 +18,13 @@ import (
  * When the time comes to remove support for V1 plugins, flipping
  * this bool is all that will be needed.
  */
-const allowV1PluginsFallback bool = true
+const allowV1PluginsFallback = true
 
 /* defaultAPIVersion is the version of the plugin API for volume, network,
    IPAM and authz. This is a very stable API. When we update this API, then
    pluginType should include a version. e.g. "networkdriver/2.0".
 */
-const defaultAPIVersion string = "1.0"
+const defaultAPIVersion = "1.0"
 
 // GetV2Plugin retrieves a plugin by name, id or partial ID.
 func (ps *Store) GetV2Plugin(refOrID string) (*v2.Plugin, error) {
@@ -153,7 +153,8 @@ func (ps *Store) Get(name, capability string, mode int) (plugingetter.CompatPlug
 			// but we should error out right away
 			return nil, errDisabled(name)
 		}
-		if _, ok := errors.Cause(err).(errNotFound); !ok {
+		var ierr errNotFound
+		if !errors.As(err, &ierr) {
 			return nil, err
 		}
 	}
@@ -166,7 +167,7 @@ func (ps *Store) Get(name, capability string, mode int) (plugingetter.CompatPlug
 	if err == nil {
 		return p, nil
 	}
-	if errors.Cause(err) == plugins.ErrNotFound {
+	if errors.Is(err, plugins.ErrNotFound) {
 		return nil, errNotFound(name)
 	}
 	return nil, errors.Wrap(errdefs.System(err), "legacy plugin")
@@ -188,9 +189,7 @@ func (ps *Store) GetAllByCap(capability string) ([]plugingetter.CompatPlugin, er
 	 * bypassing the daemon. For such tests, this check is necessary.
 	 */
 	if ps != nil {
-		ps.RLock()
 		result = ps.getAllByCap(capability)
-		ps.RUnlock()
 	}
 
 	// Lookup with legacy model
@@ -250,10 +249,8 @@ func (ps *Store) CallHandler(p *v2.Plugin) {
 	}
 }
 
+// resolvePluginID must be protected by ps.RLock
 func (ps *Store) resolvePluginID(idOrName string) (string, error) {
-	ps.RLock() // todo: fix
-	defer ps.RUnlock()
-
 	if validFullID.MatchString(idOrName) {
 		return idOrName, nil
 	}

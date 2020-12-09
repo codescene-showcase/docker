@@ -19,7 +19,7 @@ import (
 	refstore "github.com/docker/docker/reference"
 	"github.com/docker/docker/registry"
 	"github.com/docker/libtrust"
-	"github.com/opencontainers/go-digest"
+	digest "github.com/opencontainers/go-digest"
 	specs "github.com/opencontainers/image-spec/specs-go/v1"
 )
 
@@ -60,9 +60,8 @@ type ImagePullConfig struct {
 	// Schema2Types is the valid schema2 configuration types allowed
 	// by the pull operation.
 	Schema2Types []string
-	// OS is the requested operating system of the image being pulled to ensure it can be validated
-	// when the host OS supports multiple image operating systems.
-	OS string
+	// Platform is the requested platform of the image being pulled
+	Platform *specs.Platform
 }
 
 // ImagePushConfig stores push configuration.
@@ -85,8 +84,8 @@ type ImagePushConfig struct {
 // by digest. Allows getting an image configurations rootfs from the
 // configuration.
 type ImageConfigStore interface {
-	Put([]byte) (digest.Digest, error)
-	Get(digest.Digest) ([]byte, error)
+	Put(context.Context, []byte) (digest.Digest, error)
+	Get(context.Context, digest.Digest) ([]byte, error)
 	RootFSFromConfig([]byte) (*image.RootFS, error)
 	PlatformFromConfig([]byte) (*specs.Platform, error)
 }
@@ -129,12 +128,12 @@ func NewImageConfigStoreFromStore(is image.Store) ImageConfigStore {
 	}
 }
 
-func (s *imageConfigStore) Put(c []byte) (digest.Digest, error) {
+func (s *imageConfigStore) Put(_ context.Context, c []byte) (digest.Digest, error) {
 	id, err := s.Store.Create(c)
 	return digest.Digest(id), err
 }
 
-func (s *imageConfigStore) Get(d digest.Digest) ([]byte, error) {
+func (s *imageConfigStore) Get(_ context.Context, d digest.Digest) ([]byte, error) {
 	img, err := s.Store.Get(image.IDFromDigest(d))
 	if err != nil {
 		return nil, err
@@ -171,7 +170,7 @@ func (s *imageConfigStore) PlatformFromConfig(c []byte) (*specs.Platform, error)
 	if !system.IsOSSupported(os) {
 		return nil, system.ErrNotSupportedOperatingSystem
 	}
-	return &specs.Platform{OS: os, OSVersion: unmarshalledConfig.OSVersion}, nil
+	return &specs.Platform{OS: os, Architecture: unmarshalledConfig.Architecture, Variant: unmarshalledConfig.Variant, OSVersion: unmarshalledConfig.OSVersion}, nil
 }
 
 type storeLayerProvider struct {

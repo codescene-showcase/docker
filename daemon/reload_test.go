@@ -1,6 +1,7 @@
 package daemon // import "github.com/docker/docker/daemon"
 
 import (
+	"os"
 	"reflect"
 	"sort"
 	"testing"
@@ -12,9 +13,15 @@ import (
 	_ "github.com/docker/docker/pkg/discovery/memory"
 	"github.com/docker/docker/registry"
 	"github.com/docker/libnetwork"
-	"github.com/gotestyourself/gotestyourself/assert"
-	is "github.com/gotestyourself/gotestyourself/assert/cmp"
+	"github.com/sirupsen/logrus"
+	"gotest.tools/v3/assert"
+	is "gotest.tools/v3/assert/cmp"
 )
+
+// muteLogs suppresses logs that are generated during the test
+func muteLogs() {
+	logrus.SetLevel(logrus.ErrorLevel)
+}
 
 func TestDaemonReloadLabels(t *testing.T) {
 	daemon := &Daemon{
@@ -25,6 +32,7 @@ func TestDaemonReloadLabels(t *testing.T) {
 		},
 		imageService: images.NewImageService(images.ImageServiceConfig{}),
 	}
+	muteLogs()
 
 	valuesSets := make(map[string]interface{})
 	valuesSets["labels"] = "foo:baz"
@@ -50,6 +58,7 @@ func TestDaemonReloadAllowNondistributableArtifacts(t *testing.T) {
 		configStore:  &config.Config{},
 		imageService: images.NewImageService(images.ImageServiceConfig{}),
 	}
+	muteLogs()
 
 	var err error
 	// Initialize daemon with some registries.
@@ -89,7 +98,7 @@ func TestDaemonReloadAllowNondistributableArtifacts(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	actual := []string{}
+	var actual []string
 	serviceConfig := daemon.RegistryService.ServiceConfig()
 	for _, value := range serviceConfig.AllowNondistributableArtifactsCIDRs {
 		actual = append(actual, value.String())
@@ -105,6 +114,8 @@ func TestDaemonReloadMirrors(t *testing.T) {
 	daemon := &Daemon{
 		imageService: images.NewImageService(images.ImageServiceConfig{}),
 	}
+	muteLogs()
+
 	var err error
 	daemon.RegistryService, err = registry.NewService(registry.ServiceOptions{
 		InsecureRegistries: []string{},
@@ -204,6 +215,8 @@ func TestDaemonReloadInsecureRegistries(t *testing.T) {
 	daemon := &Daemon{
 		imageService: images.NewImageService(images.ImageServiceConfig{}),
 	}
+	muteLogs()
+
 	var err error
 	// initialize daemon with existing insecure registries: "127.0.0.0/8", "10.10.1.11:5000", "10.10.1.22:5000"
 	daemon.RegistryService, err = registry.NewService(registry.ServiceOptions{
@@ -296,6 +309,8 @@ func TestDaemonReloadNotAffectOthers(t *testing.T) {
 	daemon := &Daemon{
 		imageService: images.NewImageService(images.ImageServiceConfig{}),
 	}
+	muteLogs()
+
 	daemon.configStore = &config.Config{
 		CommonConfig: config.CommonConfig{
 			Labels: []string{"foo:bar"},
@@ -330,6 +345,7 @@ func TestDaemonDiscoveryReload(t *testing.T) {
 	daemon := &Daemon{
 		imageService: images.NewImageService(images.ImageServiceConfig{}),
 	}
+	muteLogs()
 	daemon.configStore = &config.Config{
 		CommonConfig: config.CommonConfig{
 			ClusterStore:     "memory://127.0.0.1",
@@ -410,6 +426,7 @@ func TestDaemonDiscoveryReloadFromEmptyDiscovery(t *testing.T) {
 		imageService: images.NewImageService(images.ImageServiceConfig{}),
 	}
 	daemon.configStore = &config.Config{}
+	muteLogs()
 
 	valuesSet := make(map[string]interface{})
 	valuesSet["cluster-store"] = "memory://127.0.0.1:2222"
@@ -499,6 +516,9 @@ func TestDaemonDiscoveryReloadOnlyClusterAdvertise(t *testing.T) {
 }
 
 func TestDaemonReloadNetworkDiagnosticPort(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Skip("root required")
+	}
 	daemon := &Daemon{
 		imageService: images.NewImageService(images.ImageServiceConfig{}),
 	}

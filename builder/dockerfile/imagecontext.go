@@ -4,14 +4,16 @@ import (
 	"context"
 	"runtime"
 
+	"github.com/containerd/containerd/platforms"
 	"github.com/docker/docker/api/types/backend"
 	"github.com/docker/docker/builder"
 	dockerimage "github.com/docker/docker/image"
+	specs "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 )
 
-type getAndMountFunc func(string, bool, string) (builder.Image, builder.ROLayer, error)
+type getAndMountFunc func(string, bool, *specs.Platform) (builder.Image, builder.ROLayer, error)
 
 // imageSources mounts images and provides a cache for mounted images. It tracks
 // all images so they can be unmounted at the end of the build.
@@ -22,7 +24,7 @@ type imageSources struct {
 }
 
 func newImageSources(ctx context.Context, options builderOptions) *imageSources {
-	getAndMount := func(idOrRef string, localOnly bool, osForPull string) (builder.Image, builder.ROLayer, error) {
+	getAndMount := func(idOrRef string, localOnly bool, platform *specs.Platform) (builder.Image, builder.ROLayer, error) {
 		pullOption := backend.PullOptionNoPull
 		if !localOnly {
 			if options.Options.PullParent {
@@ -35,7 +37,7 @@ func newImageSources(ctx context.Context, options builderOptions) *imageSources 
 			PullOption: pullOption,
 			AuthConfig: options.Options.AuthConfigs,
 			Output:     options.ProgressWriter.Output,
-			OS:         osForPull,
+			Platform:   platform,
 		})
 	}
 
@@ -45,17 +47,17 @@ func newImageSources(ctx context.Context, options builderOptions) *imageSources 
 	}
 }
 
-func (m *imageSources) Get(idOrRef string, localOnly bool, osForPull string) (*imageMount, error) {
+func (m *imageSources) Get(idOrRef string, localOnly bool, platform *specs.Platform) (*imageMount, error) {
 	if im, ok := m.byImageID[idOrRef]; ok {
 		return im, nil
 	}
 
-	image, layer, err := m.getImage(idOrRef, localOnly, osForPull)
+	image, layer, err := m.getImage(idOrRef, localOnly, platform)
 	if err != nil {
 		return nil, err
 	}
 	im := newImageMount(image, layer)
-	m.Add(im)
+	m.Add(im, platform)
 	return im, nil
 }
 
@@ -69,16 +71,26 @@ func (m *imageSources) Unmount() (retErr error) {
 	return
 }
 
-func (m *imageSources) Add(im *imageMount) {
+func (m *imageSources) Add(im *imageMount, platform *specs.Platform) {
 	switch im.image {
 	case nil:
-		// set the OS for scratch images
-		os := runtime.GOOS
+		// Set the platform for scratch images
+		if platform == nil {
+			p := platforms.DefaultSpec()
+			platform = &p
+		}
+
 		// Windows does not support scratch except for LCOW
+		os := platform.OS
 		if runtime.GOOS == "windows" {
 			os = "linux"
 		}
-		im.image = &dockerimage.Image{V1Image: dockerimage.V1Image{OS: os}}
+
+		im.image = &dockerimage.Image{V1Image: dockerimage.V1Image{
+			OS:           os,
+			Architecture: platform.Architecture,
+			Variant:      platform.Variant,
+		}}
 	default:
 		m.byImageID[im.image.ImageID()] = im
 	}
@@ -87,9 +99,8 @@ func (m *imageSources) Add(im *imageMount) {
 
 // imageMount is a reference to an image that can be used as a builder.Source
 type imageMount struct {
-	image  builder.Image
-	source builder.Source
-	layer  builder.ROLayer
+	image builder.Image
+	layer builder.ROLayer
 }
 
 func newImageMount(image builder.Image, layer builder.ROLayer) *imageMount {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"strconv"
 
@@ -21,7 +22,21 @@ import (
 func (sr *swarmRouter) initCluster(ctx context.Context, w http.ResponseWriter, r *http.Request, vars map[string]string) error {
 	var req types.InitRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		return err
+		if err == io.EOF {
+			return errdefs.InvalidParameter(errors.New("got EOF while reading request body"))
+		}
+		return errdefs.InvalidParameter(err)
+	}
+	version := httputils.VersionFromContext(ctx)
+
+	// DefaultAddrPool and SubnetSize were added in API 1.39. Ignore on older API versions.
+	if versions.LessThan(version, "1.39") {
+		req.DefaultAddrPool = nil
+		req.SubnetSize = 0
+	}
+	// DataPathPort was added in API 1.40. Ignore this option on older API versions.
+	if versions.LessThan(version, "1.40") {
+		req.DataPathPort = 0
 	}
 	nodeID, err := sr.backend.Init(req)
 	if err != nil {
@@ -34,7 +49,10 @@ func (sr *swarmRouter) initCluster(ctx context.Context, w http.ResponseWriter, r
 func (sr *swarmRouter) joinCluster(ctx context.Context, w http.ResponseWriter, r *http.Request, vars map[string]string) error {
 	var req types.JoinRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		return err
+		if err == io.EOF {
+			return errdefs.InvalidParameter(errors.New("got EOF while reading request body"))
+		}
+		return errdefs.InvalidParameter(err)
 	}
 	return sr.backend.Join(req)
 }
@@ -61,7 +79,10 @@ func (sr *swarmRouter) inspectCluster(ctx context.Context, w http.ResponseWriter
 func (sr *swarmRouter) updateCluster(ctx context.Context, w http.ResponseWriter, r *http.Request, vars map[string]string) error {
 	var swarm types.Spec
 	if err := json.NewDecoder(r.Body).Decode(&swarm); err != nil {
-		return err
+		if err == io.EOF {
+			return errdefs.InvalidParameter(errors.New("got EOF while reading request body"))
+		}
+		return errdefs.InvalidParameter(err)
 	}
 
 	rawVersion := r.URL.Query().Get("version")
@@ -112,7 +133,10 @@ func (sr *swarmRouter) updateCluster(ctx context.Context, w http.ResponseWriter,
 func (sr *swarmRouter) unlockCluster(ctx context.Context, w http.ResponseWriter, r *http.Request, vars map[string]string) error {
 	var req types.UnlockRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		return err
+		if err == io.EOF {
+			return errdefs.InvalidParameter(errors.New("got EOF while reading request body"))
+		}
+		return errdefs.InvalidParameter(err)
 	}
 
 	if err := sr.backend.UnlockSwarm(req); err != nil {
@@ -143,7 +167,19 @@ func (sr *swarmRouter) getServices(ctx context.Context, w http.ResponseWriter, r
 		return errdefs.InvalidParameter(err)
 	}
 
-	services, err := sr.backend.GetServices(basictypes.ServiceListOptions{Filters: filter})
+	// the status query parameter is only support in API versions >= 1.41. If
+	// the client is using a lesser version, ignore the parameter.
+	cliVersion := httputils.VersionFromContext(ctx)
+	var status bool
+	if value := r.URL.Query().Get("status"); value != "" && !versions.LessThan(cliVersion, "1.41") {
+		var err error
+		status, err = strconv.ParseBool(value)
+		if err != nil {
+			return errors.Wrapf(errdefs.InvalidParameter(err), "invalid value for status: %s", value)
+		}
+	}
+
+	services, err := sr.backend.GetServices(basictypes.ServiceListOptions{Filters: filter, Status: status})
 	if err != nil {
 		logrus.Errorf("Error getting services: %v", err)
 		return err
@@ -154,14 +190,20 @@ func (sr *swarmRouter) getServices(ctx context.Context, w http.ResponseWriter, r
 
 func (sr *swarmRouter) getService(ctx context.Context, w http.ResponseWriter, r *http.Request, vars map[string]string) error {
 	var insertDefaults bool
+
 	if value := r.URL.Query().Get("insertDefaults"); value != "" {
 		var err error
 		insertDefaults, err = strconv.ParseBool(value)
 		if err != nil {
-			err := fmt.Errorf("invalid value for insertDefaults: %s", value)
 			return errors.Wrapf(errdefs.InvalidParameter(err), "invalid value for insertDefaults: %s", value)
 		}
 	}
+
+	// you may note that there is no code here to handle the "status" query
+	// parameter, as in getServices. the Status field is not supported when
+	// retrieving an individual service because the Backend API changes
+	// required to accommodate it would be too disruptive, and because that
+	// field is so rarely needed as part of an individual service inspection.
 
 	service, err := sr.backend.GetService(vars["id"], insertDefaults)
 	if err != nil {
@@ -175,17 +217,21 @@ func (sr *swarmRouter) getService(ctx context.Context, w http.ResponseWriter, r 
 func (sr *swarmRouter) createService(ctx context.Context, w http.ResponseWriter, r *http.Request, vars map[string]string) error {
 	var service types.ServiceSpec
 	if err := json.NewDecoder(r.Body).Decode(&service); err != nil {
-		return err
+		if err == io.EOF {
+			return errdefs.InvalidParameter(errors.New("got EOF while reading request body"))
+		}
+		return errdefs.InvalidParameter(err)
 	}
 
 	// Get returns "" if the header does not exist
 	encodedAuth := r.Header.Get("X-Registry-Auth")
-	cliVersion := r.Header.Get("version")
 	queryRegistry := false
-	if cliVersion != "" && versions.LessThan(cliVersion, "1.30") {
-		queryRegistry = true
+	if v := httputils.VersionFromContext(ctx); v != "" {
+		if versions.LessThan(v, "1.30") {
+			queryRegistry = true
+		}
+		adjustForAPIVersion(v, &service)
 	}
-
 	resp, err := sr.backend.CreateService(service, encodedAuth, queryRegistry)
 	if err != nil {
 		logrus.Errorf("Error creating service %s: %v", service.Name, err)
@@ -198,7 +244,10 @@ func (sr *swarmRouter) createService(ctx context.Context, w http.ResponseWriter,
 func (sr *swarmRouter) updateService(ctx context.Context, w http.ResponseWriter, r *http.Request, vars map[string]string) error {
 	var service types.ServiceSpec
 	if err := json.NewDecoder(r.Body).Decode(&service); err != nil {
-		return err
+		if err == io.EOF {
+			return errdefs.InvalidParameter(errors.New("got EOF while reading request body"))
+		}
+		return errdefs.InvalidParameter(err)
 	}
 
 	rawVersion := r.URL.Query().Get("version")
@@ -214,10 +263,12 @@ func (sr *swarmRouter) updateService(ctx context.Context, w http.ResponseWriter,
 	flags.EncodedRegistryAuth = r.Header.Get("X-Registry-Auth")
 	flags.RegistryAuthFrom = r.URL.Query().Get("registryAuthFrom")
 	flags.Rollback = r.URL.Query().Get("rollback")
-	cliVersion := r.Header.Get("version")
 	queryRegistry := false
-	if cliVersion != "" && versions.LessThan(cliVersion, "1.30") {
-		queryRegistry = true
+	if v := httputils.VersionFromContext(ctx); v != "" {
+		if versions.LessThan(v, "1.30") {
+			queryRegistry = true
+		}
+		adjustForAPIVersion(v, &service)
 	}
 
 	resp, err := sr.backend.UpdateService(vars["id"], version, service, flags, queryRegistry)
@@ -291,7 +342,10 @@ func (sr *swarmRouter) getNode(ctx context.Context, w http.ResponseWriter, r *ht
 func (sr *swarmRouter) updateNode(ctx context.Context, w http.ResponseWriter, r *http.Request, vars map[string]string) error {
 	var node types.NodeSpec
 	if err := json.NewDecoder(r.Body).Decode(&node); err != nil {
-		return err
+		if err == io.EOF {
+			return errdefs.InvalidParameter(errors.New("got EOF while reading request body"))
+		}
+		return errdefs.InvalidParameter(err)
 	}
 
 	rawVersion := r.URL.Query().Get("version")
@@ -370,7 +424,10 @@ func (sr *swarmRouter) getSecrets(ctx context.Context, w http.ResponseWriter, r 
 func (sr *swarmRouter) createSecret(ctx context.Context, w http.ResponseWriter, r *http.Request, vars map[string]string) error {
 	var secret types.SecretSpec
 	if err := json.NewDecoder(r.Body).Decode(&secret); err != nil {
-		return err
+		if err == io.EOF {
+			return errdefs.InvalidParameter(errors.New("got EOF while reading request body"))
+		}
+		return errdefs.InvalidParameter(err)
 	}
 	version := httputils.VersionFromContext(ctx)
 	if secret.Templating != nil && versions.LessThan(version, "1.37") {
@@ -408,6 +465,9 @@ func (sr *swarmRouter) getSecret(ctx context.Context, w http.ResponseWriter, r *
 func (sr *swarmRouter) updateSecret(ctx context.Context, w http.ResponseWriter, r *http.Request, vars map[string]string) error {
 	var secret types.SecretSpec
 	if err := json.NewDecoder(r.Body).Decode(&secret); err != nil {
+		if err == io.EOF {
+			return errdefs.InvalidParameter(errors.New("got EOF while reading request body"))
+		}
 		return errdefs.InvalidParameter(err)
 	}
 
@@ -441,7 +501,10 @@ func (sr *swarmRouter) getConfigs(ctx context.Context, w http.ResponseWriter, r 
 func (sr *swarmRouter) createConfig(ctx context.Context, w http.ResponseWriter, r *http.Request, vars map[string]string) error {
 	var config types.ConfigSpec
 	if err := json.NewDecoder(r.Body).Decode(&config); err != nil {
-		return err
+		if err == io.EOF {
+			return errdefs.InvalidParameter(errors.New("got EOF while reading request body"))
+		}
+		return errdefs.InvalidParameter(err)
 	}
 
 	version := httputils.VersionFromContext(ctx)
@@ -480,6 +543,9 @@ func (sr *swarmRouter) getConfig(ctx context.Context, w http.ResponseWriter, r *
 func (sr *swarmRouter) updateConfig(ctx context.Context, w http.ResponseWriter, r *http.Request, vars map[string]string) error {
 	var config types.ConfigSpec
 	if err := json.NewDecoder(r.Body).Decode(&config); err != nil {
+		if err == io.EOF {
+			return errdefs.InvalidParameter(errors.New("got EOF while reading request body"))
+		}
 		return errdefs.InvalidParameter(err)
 	}
 

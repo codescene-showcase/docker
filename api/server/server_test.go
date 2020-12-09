@@ -1,12 +1,11 @@
 package server // import "github.com/docker/docker/api/server"
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
-
-	"context"
 
 	"github.com/docker/docker/api"
 	"github.com/docker/docker/api/server/httputils"
@@ -23,7 +22,7 @@ func TestMiddlewares(t *testing.T) {
 
 	srv.UseMiddleware(middleware.NewVersionMiddleware("0.1omega2", api.DefaultVersion, api.MinVersion))
 
-	req, _ := http.NewRequest("GET", "/containers/json", nil)
+	req, _ := http.NewRequest(http.MethodGet, "/containers/json", nil)
 	resp := httptest.NewRecorder()
 	ctx := context.Background()
 

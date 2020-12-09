@@ -5,15 +5,17 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"runtime"
 	"strings"
 
 	"github.com/containerd/continuity/driver"
 	"github.com/docker/docker/api/types/backend"
 	"github.com/docker/docker/builder"
-	"github.com/docker/docker/builder/dockerfile/parser"
-	"github.com/docker/docker/builder/dockerignore"
+	"github.com/docker/docker/errdefs"
 	"github.com/docker/docker/pkg/fileutils"
 	"github.com/docker/docker/pkg/urlutil"
+	"github.com/moby/buildkit/frontend/dockerfile/dockerignore"
+	"github.com/moby/buildkit/frontend/dockerfile/parser"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 )
@@ -22,8 +24,7 @@ import (
 const ClientSessionRemote = "client-session"
 
 // Detect returns a context and dockerfile from remote location or local
-// archive. progressReader is only used if remoteURL is actually a URL
-// (not empty, and not a Git endpoint).
+// archive.
 func Detect(config backend.BuildConfig) (remote builder.Source, dockerfile *parser.Result, err error) {
 	remoteURL := config.Options.RemoteContext
 	dockerfilePath := config.Options.Dockerfile
@@ -32,11 +33,7 @@ func Detect(config backend.BuildConfig) (remote builder.Source, dockerfile *pars
 	case remoteURL == "":
 		remote, dockerfile, err = newArchiveRemote(config.Source, dockerfilePath)
 	case remoteURL == ClientSessionRemote:
-		res, err := parser.Parse(config.Source)
-		if err != nil {
-			return nil, nil, err
-		}
-		return nil, res, nil
+		return nil, nil, errdefs.InvalidParameter(errors.New("experimental session with v1 builder is no longer supported, use builder version v2 (BuildKit) instead"))
 	case urlutil.IsGitURL(remoteURL):
 		remote, dockerfile, err = newGitRemote(remoteURL, dockerfilePath)
 	case urlutil.IsURL(remoteURL):
@@ -60,7 +57,7 @@ func newArchiveRemote(rc io.ReadCloser, dockerfilePath string) (builder.Source, 
 func withDockerfileFromContext(c modifiableContext, dockerfilePath string) (builder.Source, *parser.Result, error) {
 	df, err := openAt(c, dockerfilePath)
 	if err != nil {
-		if os.IsNotExist(err) {
+		if errors.Is(err, os.ErrNotExist) {
 			if dockerfilePath == builder.DefaultDockerfileName {
 				lowercase := strings.ToLower(dockerfilePath)
 				if _, err := StatAt(c, lowercase); err == nil {
@@ -106,7 +103,7 @@ func newURLRemote(url string, dockerfilePath string, progressReader func(in io.R
 	switch contentType {
 	case mimeTypes.TextPlain:
 		res, err := parser.Parse(progressReader(content))
-		return nil, res, err
+		return nil, res, errdefs.InvalidParameter(err)
 	default:
 		source, err := FromArchive(progressReader(content))
 		if err != nil {
@@ -146,11 +143,17 @@ func readAndParseDockerfile(name string, rc io.Reader) (*parser.Result, error) {
 	br := bufio.NewReader(rc)
 	if _, err := br.Peek(1); err != nil {
 		if err == io.EOF {
-			return nil, errors.Errorf("the Dockerfile (%s) cannot be empty", name)
+			return nil, errdefs.InvalidParameter(errors.Errorf("the Dockerfile (%s) cannot be empty", name))
 		}
 		return nil, errors.Wrap(err, "unexpected error reading Dockerfile")
 	}
-	return parser.Parse(br)
+
+	dockerfile, err := parser.Parse(br)
+	if err != nil {
+		return nil, errdefs.InvalidParameter(errors.Wrapf(err, "failed to parse %s", name))
+	}
+
+	return dockerfile, nil
 }
 
 func openAt(remote builder.Source, path string) (driver.File, error) {
@@ -174,7 +177,10 @@ func StatAt(remote builder.Source, path string) (os.FileInfo, error) {
 func FullPath(remote builder.Source, path string) (string, error) {
 	fullPath, err := remote.Root().ResolveScopedPath(path, true)
 	if err != nil {
-		return "", fmt.Errorf("Forbidden path outside the build context: %s (%s)", path, fullPath) // backwards compat with old error
+		if runtime.GOOS == "windows" {
+			return "", fmt.Errorf("failed to resolve scoped path %s (%s): %s. Possible cause is a forbidden path outside the build context", path, fullPath, err)
+		}
+		return "", fmt.Errorf("forbidden path outside the build context: %s (%s)", path, fullPath) // backwards compat with old error
 	}
 	return fullPath, nil
 }

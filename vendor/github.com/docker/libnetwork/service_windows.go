@@ -4,7 +4,7 @@ import (
 	"net"
 
 	"github.com/Microsoft/hcsshim"
-	"github.com/docker/docker/pkg/system"
+	"github.com/Microsoft/hcsshim/osversion"
 	"github.com/sirupsen/logrus"
 )
 
@@ -19,9 +19,15 @@ func init() {
 	lbPolicylistMap = make(map[*loadBalancer]*policyLists)
 }
 
-func (n *network) addLBBackend(ip, vip net.IP, lb *loadBalancer, ingressPorts []*PortConfig) {
+func (n *network) addLBBackend(ip net.IP, lb *loadBalancer) {
+	if len(lb.vip) == 0 {
+		return
+	}
 
-	if system.GetOSVersion().Build > 16236 {
+	vip := lb.vip
+	ingressPorts := lb.service.ingressPorts
+
+	if osversion.Build() > 16236 {
 		lb.Lock()
 		defer lb.Unlock()
 		//find the load balancer IP for the network.
@@ -117,11 +123,15 @@ func (n *network) addLBBackend(ip, vip net.IP, lb *loadBalancer, ingressPorts []
 	}
 }
 
-func (n *network) rmLBBackend(ip, vip net.IP, lb *loadBalancer, ingressPorts []*PortConfig, rmService bool, fullRemove bool) {
-	if system.GetOSVersion().Build > 16236 {
+func (n *network) rmLBBackend(ip net.IP, lb *loadBalancer, rmService bool, fullRemove bool) {
+	if len(lb.vip) == 0 {
+		return
+	}
+
+	if osversion.Build() > 16236 {
 		if numEnabledBackends(lb) > 0 {
 			//Reprogram HNS (actually VFP) with the existing backends.
-			n.addLBBackend(ip, vip, lb, ingressPorts)
+			n.addLBBackend(ip, lb)
 		} else {
 			lb.Lock()
 			defer lb.Unlock()
@@ -156,7 +166,7 @@ func numEnabledBackends(lb *loadBalancer) int {
 	return nEnabled
 }
 
-func (sb *sandbox) populateLoadbalancers(ep *endpoint) {
+func (sb *sandbox) populateLoadBalancers(ep *endpoint) {
 }
 
 func arrangeIngressFilterRule() {

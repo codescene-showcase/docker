@@ -19,11 +19,12 @@ package metadata
 import (
 	"context"
 
-	"github.com/boltdb/bolt"
 	"github.com/containerd/containerd/errdefs"
+	"github.com/containerd/containerd/identifiers"
 	l "github.com/containerd/containerd/labels"
 	"github.com/containerd/containerd/namespaces"
 	"github.com/pkg/errors"
+	bolt "go.etcd.io/bbolt"
 )
 
 type namespaceStore struct {
@@ -41,7 +42,7 @@ func (s *namespaceStore) Create(ctx context.Context, namespace string, labels ma
 		return err
 	}
 
-	if err := namespaces.Validate(namespace); err != nil {
+	if err := identifiers.Validate(namespace); err != nil {
 		return err
 	}
 
@@ -129,7 +130,15 @@ func (s *namespaceStore) List(ctx context.Context) ([]string, error) {
 	return namespaces, nil
 }
 
-func (s *namespaceStore) Delete(ctx context.Context, namespace string) error {
+func (s *namespaceStore) Delete(ctx context.Context, namespace string, opts ...namespaces.DeleteOpts) error {
+	i := &namespaces.DeleteInfo{
+		Name: namespace,
+	}
+	for _, o := range opts {
+		if err := o(ctx, i); err != nil {
+			return err
+		}
+	}
 	bkt := getBucket(s.tx, bucketKeyVersion)
 	if empty, err := s.namespaceEmpty(ctx, namespace); err != nil {
 		return err

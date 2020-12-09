@@ -69,7 +69,7 @@ func (i *ImageService) Images(imageFilters filters.Args, all bool, withExtraAttr
 
 	var beforeFilter, sinceFilter *image.Image
 	err = imageFilters.WalkValues("before", func(value string) error {
-		beforeFilter, err = i.GetImage(value)
+		beforeFilter, err = i.GetImage(value, nil)
 		return err
 	})
 	if err != nil {
@@ -77,7 +77,7 @@ func (i *ImageService) Images(imageFilters filters.Args, all bool, withExtraAttr
 	}
 
 	err = imageFilters.WalkValues("since", func(value string) error {
-		sinceFilter, err = i.GetImage(value)
+		sinceFilter, err = i.GetImage(value, nil)
 		return err
 	})
 	if err != nil {
@@ -152,6 +152,9 @@ func (i *ImageService) Images(imageFilters filters.Args, all bool, withExtraAttr
 					if matchErr != nil {
 						return nil, matchErr
 					}
+					if found {
+						break
+					}
 				}
 				if !found {
 					continue
@@ -168,7 +171,7 @@ func (i *ImageService) Images(imageFilters filters.Args, all bool, withExtraAttr
 			if all || len(i.imageStore.Children(id)) == 0 {
 
 				if imageFilters.Contains("dangling") && !danglingOnly {
-					//dangling=false case, so dangling image is not needed
+					// dangling=false case, so dangling image is not needed
 					continue
 				}
 				if imageFilters.Contains("reference") { // skip images with no references if filtering by reference
@@ -187,7 +190,15 @@ func (i *ImageService) Images(imageFilters filters.Args, all bool, withExtraAttr
 			// lazily init variables
 			if imagesMap == nil {
 				allContainers = i.containers.List()
-				allLayers = i.layerStores[img.OperatingSystem()].Map()
+
+				// allLayers is built from all layerstores combined
+				allLayers = make(map[layer.ChainID]layer.Layer)
+				for _, ls := range i.layerStores {
+					layers := ls.Map()
+					for k, v := range layers {
+						allLayers[k] = v
+					}
+				}
 				imagesMap = make(map[*image.Image]*types.ImageSummary)
 				layerRefs = make(map[layer.ChainID]int)
 			}

@@ -13,12 +13,12 @@ import (
 	"unsafe"
 
 	"github.com/docker/docker/daemon/graphdriver"
-	"github.com/docker/docker/daemon/graphdriver/quota"
 	"github.com/docker/docker/pkg/stringid"
+	"github.com/docker/docker/quota"
 	units "github.com/docker/go-units"
-	"github.com/gotestyourself/gotestyourself/assert"
-	is "github.com/gotestyourself/gotestyourself/assert/cmp"
 	"golang.org/x/sys/unix"
+	"gotest.tools/v3/assert"
+	is "gotest.tools/v3/assert/cmp"
 )
 
 var (

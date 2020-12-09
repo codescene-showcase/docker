@@ -19,17 +19,17 @@ tmp() {
 }
 
 apkv() {
-	curl -sSL $MAINREPO/$ARCH/APKINDEX.tar.gz | tar -Oxz |
-		grep --text '^P:apk-tools-static$' -A1 | tail -n1 | cut -d: -f2
+	curl -sSL $MAINREPO/$ARCH/APKINDEX.tar.gz | tar -Oxz \
+		| grep --text '^P:apk-tools-static$' -A1 | tail -n1 | cut -d: -f2
 }
 
 getapk() {
-	curl -sSL $MAINREPO/$ARCH/apk-tools-static-$(apkv).apk |
-		tar -xz -C $TMP sbin/apk.static
+	curl -sSL $MAINREPO/$ARCH/apk-tools-static-$(apkv).apk \
+		| tar -xz -C $TMP sbin/apk.static
 }
 
 mkbase() {
-	$TMP/sbin/apk.static --repository $MAINREPO --update-cache --allow-untrusted \
+	$TMP/sbin/apk.static --repository $MAINREPO --no-cache --allow-untrusted \
 		--root $ROOTFS --initdb add alpine-base
 }
 
@@ -43,7 +43,7 @@ pack() {
 	id=$(tar --numeric-owner -C $ROOTFS -c . | docker import - alpine:$REL)
 
 	docker tag $id alpine:latest
-	docker run -i -t --rm alpine printf 'alpine:%s with id=%s created!\n' $REL $id
+	docker run --rm alpine printf 'alpine:%s with id=%s created!\n' $REL $id
 }
 
 save() {

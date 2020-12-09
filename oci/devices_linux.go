@@ -25,13 +25,12 @@ func Device(d *configs.Device) specs.LinuxDevice {
 }
 
 func deviceCgroup(d *configs.Device) specs.LinuxDeviceCgroup {
-	t := string(d.Type)
 	return specs.LinuxDeviceCgroup{
 		Allow:  true,
-		Type:   t,
+		Type:   string(d.Type),
 		Major:  &d.Major,
 		Minor:  &d.Minor,
-		Access: d.Permissions,
+		Access: string(d.Permissions),
 	}
 }
 
@@ -61,7 +60,8 @@ func DevicesFromPath(pathOnHost, pathInContainer, cgroupPermissions string) (dev
 		if src, e := os.Stat(resolvedPathOnHost); e == nil && src.IsDir() {
 
 			// mount the internal devices recursively
-			filepath.Walk(resolvedPathOnHost, func(dpath string, f os.FileInfo, e error) error {
+			// TODO check if additional errors should be handled or logged
+			_ = filepath.Walk(resolvedPathOnHost, func(dpath string, f os.FileInfo, _ error) error {
 				childDevice, e := devices.DeviceFromPath(dpath, cgroupPermissions)
 				if e != nil {
 					// ignore the device

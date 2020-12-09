@@ -18,7 +18,6 @@ package cgroups
 
 import (
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 
@@ -49,8 +48,8 @@ func (n *netprioController) Create(path string, resources *specs.LinuxResources)
 	}
 	if resources.Network != nil {
 		for _, prio := range resources.Network.Priorities {
-			if err := ioutil.WriteFile(
-				filepath.Join(n.Path(path), "net_prio_ifpriomap"),
+			if err := retryingWriteFile(
+				filepath.Join(n.Path(path), "net_prio.ifpriomap"),
 				formatPrio(prio.Name, prio.Priority),
 				defaultFilePerm,
 			); err != nil {

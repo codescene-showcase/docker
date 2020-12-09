@@ -19,6 +19,7 @@ import (
 	swarmnode "github.com/docker/swarmkit/node"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
+	"google.golang.org/grpc"
 )
 
 // Init initializes new cluster from user provided request.
@@ -32,6 +33,7 @@ func (c *Cluster) Init(req types.InitRequest) (string, error) {
 			// API handlers to finish before shutting down the node.
 			c.mu.Lock()
 			if !c.nr.nodeState.IsManager() {
+				c.mu.Unlock()
 				return "", errSwarmNotManager
 			}
 			c.mu.Unlock()
@@ -92,14 +94,26 @@ func (c *Cluster) Init(req types.InitRequest) (string, error) {
 		}
 	}
 
+	if err := validateDefaultAddrPool(req.DefaultAddrPool, req.SubnetSize); err != nil {
+		return "", err
+	}
+
+	port, err := getDataPathPort(req.DataPathPort)
+	if err != nil {
+		return "", err
+	}
+
 	nr, err := c.newNodeRunner(nodeStartConfig{
-		forceNewCluster: req.ForceNewCluster,
-		autolock:        req.AutoLockManagers,
-		LocalAddr:       localAddr,
-		ListenAddr:      net.JoinHostPort(listenHost, listenPort),
-		AdvertiseAddr:   net.JoinHostPort(advertiseHost, advertisePort),
-		DataPathAddr:    dataPathAddr,
-		availability:    req.Availability,
+		forceNewCluster:    req.ForceNewCluster,
+		autolock:           req.AutoLockManagers,
+		LocalAddr:          localAddr,
+		ListenAddr:         net.JoinHostPort(listenHost, listenPort),
+		AdvertiseAddr:      net.JoinHostPort(advertiseHost, advertisePort),
+		DataPathAddr:       dataPathAddr,
+		DefaultAddressPool: req.DefaultAddrPool,
+		SubnetSize:         req.SubnetSize,
+		availability:       req.Availability,
+		DataPathPort:       port,
 	})
 	if err != nil {
 		return "", err
@@ -181,8 +195,11 @@ func (c *Cluster) Join(req types.JoinRequest) error {
 	c.nr = nr
 	c.mu.Unlock()
 
+	timeout := time.NewTimer(swarmConnectTimeout)
+	defer timeout.Stop()
+
 	select {
-	case <-time.After(swarmConnectTimeout):
+	case <-timeout.C:
 		return errSwarmJoinTimeoutReached
 	case err := <-nr.Ready():
 		if err != nil {
@@ -330,7 +347,7 @@ func (c *Cluster) UnlockSwarm(req types.UnlockRequest) error {
 	c.mu.Unlock()
 
 	if err := <-nr.Ready(); err != nil {
-		if errors.Cause(err) == errSwarmLocked {
+		if errors.Is(err, errSwarmLocked) {
 			return invalidUnlockKey{}
 		}
 		return errors.Errorf("swarm component could not be started: %v", err)
@@ -354,7 +371,7 @@ func (c *Cluster) Leave(force bool) error {
 
 	c.mu.Unlock()
 
-	if errors.Cause(state.err) == errSwarmLocked && !force {
+	if errors.Is(state.err, errSwarmLocked) && !force {
 		// leave a locked swarm without --force is not allowed
 		return errors.WithStack(notAvailableError("Swarm is encrypted and locked. Please unlock it first or use `--force` to ignore this message."))
 	}
@@ -436,7 +453,10 @@ func (c *Cluster) Info() types.Info {
 
 		info.Cluster = &swarm.ClusterInfo
 
-		if r, err := state.controlClient.ListNodes(ctx, &swarmapi.ListNodesRequest{}); err != nil {
+		if r, err := state.controlClient.ListNodes(
+			ctx, &swarmapi.ListNodesRequest{},
+			grpc.MaxCallRecvMsgSize(defaultRecvSizeForListResponse),
+		); err != nil {
 			info.Error = err.Error()
 		} else {
 			info.Nodes = len(r.Nodes)
@@ -444,6 +464,20 @@ func (c *Cluster) Info() types.Info {
 				if n.ManagerStatus != nil {
 					info.Managers = info.Managers + 1
 				}
+			}
+		}
+
+		switch info.LocalNodeState {
+		case types.LocalNodeStateInactive, types.LocalNodeStateLocked, types.LocalNodeStateError:
+			// nothing to do
+		default:
+			if info.Managers == 2 {
+				const warn string = `WARNING: Running Swarm in a two-manager configuration. This configuration provides
+         no fault tolerance, and poses a high risk to lose control over the cluster.
+         Refer to https://docs.docker.com/engine/swarm/admin_guide/ to configure the
+         Swarm for fault-tolerance.`
+
+				info.Warnings = append(info.Warnings, warn)
 			}
 		}
 	}

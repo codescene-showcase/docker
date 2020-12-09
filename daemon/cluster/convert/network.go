@@ -47,10 +47,10 @@ func networkFromGRPC(n *swarmapi.Network) types.Network {
 		network.CreatedAt, _ = gogotypes.TimestampFromProto(n.Meta.CreatedAt)
 		network.UpdatedAt, _ = gogotypes.TimestampFromProto(n.Meta.UpdatedAt)
 
-		//Annotations
+		// Annotations
 		network.Spec.Annotations = annotationsFromGRPC(n.Spec.Annotations)
 
-		//DriverConfiguration
+		// DriverConfiguration
 		if n.Spec.DriverConfig != nil {
 			network.Spec.DriverConfiguration = &types.Driver{
 				Name:    n.Spec.DriverConfig.Name,
@@ -58,7 +58,7 @@ func networkFromGRPC(n *swarmapi.Network) types.Network {
 			}
 		}
 
-		//DriverState
+		// DriverState
 		if n.DriverState != nil {
 			network.DriverState = types.Driver{
 				Name:    n.DriverState.Name,
@@ -140,13 +140,13 @@ func swarmPortConfigToAPIPortConfig(portConfig *swarmapi.PortConfig) types.PortC
 func BasicNetworkFromGRPC(n swarmapi.Network) basictypes.NetworkResource {
 	spec := n.Spec
 	var ipam networktypes.IPAM
-	if spec.IPAM != nil {
-		if spec.IPAM.Driver != nil {
-			ipam.Driver = spec.IPAM.Driver.Name
-			ipam.Options = spec.IPAM.Driver.Options
+	if n.IPAM != nil {
+		if n.IPAM.Driver != nil {
+			ipam.Driver = n.IPAM.Driver.Name
+			ipam.Options = n.IPAM.Driver.Options
 		}
-		ipam.Config = make([]networktypes.IPAMConfig, 0, len(spec.IPAM.Configs))
-		for _, ic := range spec.IPAM.Configs {
+		ipam.Config = make([]networktypes.IPAMConfig, 0, len(n.IPAM.Configs))
+		for _, ic := range n.IPAM.Configs {
 			ipamConfig := networktypes.IPAMConfig{
 				Subnet:     ic.Subnet,
 				IPRange:    ic.Range,

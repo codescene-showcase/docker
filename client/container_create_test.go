@@ -11,24 +11,25 @@ import (
 	"testing"
 
 	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/errdefs"
 )
 
 func TestContainerCreateError(t *testing.T) {
 	client := &Client{
 		client: newMockClient(errorMock(http.StatusInternalServerError, "Server error")),
 	}
-	_, err := client.ContainerCreate(context.Background(), nil, nil, nil, "nothing")
-	if err == nil || err.Error() != "Error response from daemon: Server error" {
-		t.Fatalf("expected a Server Error while testing StatusInternalServerError, got %v", err)
+	_, err := client.ContainerCreate(context.Background(), nil, nil, nil, nil, "nothing")
+	if !errdefs.IsSystem(err) {
+		t.Fatalf("expected a Server Error while testing StatusInternalServerError, got %T", err)
 	}
 
 	// 404 doesn't automatically means an unknown image
 	client = &Client{
 		client: newMockClient(errorMock(http.StatusNotFound, "Server error")),
 	}
-	_, err = client.ContainerCreate(context.Background(), nil, nil, nil, "nothing")
-	if err == nil || err.Error() != "Error response from daemon: Server error" {
-		t.Fatalf("expected a Server Error while testing StatusNotFound, got %v", err)
+	_, err = client.ContainerCreate(context.Background(), nil, nil, nil, nil, "nothing")
+	if err == nil || !IsErrNotFound(err) {
+		t.Fatalf("expected a Server Error while testing StatusNotFound, got %T", err)
 	}
 }
 
@@ -36,9 +37,9 @@ func TestContainerCreateImageNotFound(t *testing.T) {
 	client := &Client{
 		client: newMockClient(errorMock(http.StatusNotFound, "No such image")),
 	}
-	_, err := client.ContainerCreate(context.Background(), &container.Config{Image: "unknown_image"}, nil, nil, "unknown")
+	_, err := client.ContainerCreate(context.Background(), &container.Config{Image: "unknown_image"}, nil, nil, nil, "unknown")
 	if err == nil || !IsErrNotFound(err) {
-		t.Fatalf("expected an imageNotFound error, got %v", err)
+		t.Fatalf("expected an imageNotFound error, got %v, %T", err, err)
 	}
 }
 
@@ -66,7 +67,7 @@ func TestContainerCreateWithName(t *testing.T) {
 		}),
 	}
 
-	r, err := client.ContainerCreate(context.Background(), nil, nil, nil, "container_name")
+	r, err := client.ContainerCreate(context.Background(), nil, nil, nil, nil, "container_name")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -105,14 +106,14 @@ func TestContainerCreateAutoRemove(t *testing.T) {
 		client:  newMockClient(autoRemoveValidator(false)),
 		version: "1.24",
 	}
-	if _, err := client.ContainerCreate(context.Background(), nil, &container.HostConfig{AutoRemove: true}, nil, ""); err != nil {
+	if _, err := client.ContainerCreate(context.Background(), nil, &container.HostConfig{AutoRemove: true}, nil, nil, ""); err != nil {
 		t.Fatal(err)
 	}
 	client = &Client{
 		client:  newMockClient(autoRemoveValidator(true)),
 		version: "1.25",
 	}
-	if _, err := client.ContainerCreate(context.Background(), nil, &container.HostConfig{AutoRemove: true}, nil, ""); err != nil {
+	if _, err := client.ContainerCreate(context.Background(), nil, &container.HostConfig{AutoRemove: true}, nil, nil, ""); err != nil {
 		t.Fatal(err)
 	}
 }

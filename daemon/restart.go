@@ -3,6 +3,7 @@ package daemon // import "github.com/docker/docker/daemon"
 import (
 	"fmt"
 
+	containertypes "github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/container"
 	"github.com/sirupsen/logrus"
 )
@@ -14,15 +15,15 @@ import (
 // stop. Returns an error if the container cannot be found, or if
 // there is an underlying error at any stage of the restart.
 func (daemon *Daemon) ContainerRestart(name string, seconds *int) error {
-	container, err := daemon.GetContainer(name)
+	ctr, err := daemon.GetContainer(name)
 	if err != nil {
 		return err
 	}
 	if seconds == nil {
-		stopTimeout := container.StopTimeout()
+		stopTimeout := ctr.StopTimeout()
 		seconds = &stopTimeout
 	}
-	if err := daemon.containerRestart(container, *seconds); err != nil {
+	if err := daemon.containerRestart(ctr, *seconds); err != nil {
 		return fmt.Errorf("Cannot restart container %s: %v", name, err)
 	}
 	return nil
@@ -34,11 +35,23 @@ func (daemon *Daemon) ContainerRestart(name string, seconds *int) error {
 // gracefully stop, before forcefully terminating the container. If
 // given a negative duration, wait forever for a graceful stop.
 func (daemon *Daemon) containerRestart(container *container.Container, seconds int) error {
+
+	// Determine isolation. If not specified in the hostconfig, use daemon default.
+	actualIsolation := container.HostConfig.Isolation
+	if containertypes.Isolation.IsDefault(actualIsolation) {
+		actualIsolation = daemon.defaultIsolation
+	}
+
 	// Avoid unnecessarily unmounting and then directly mounting
 	// the container when the container stops and then starts
-	// again
-	if err := daemon.Mount(container); err == nil {
-		defer daemon.Unmount(container)
+	// again. We do not do this for Hyper-V isolated containers
+	// (implying also on Windows) as the HCS must have exclusive
+	// access to mount the containers filesystem inside the utility
+	// VM.
+	if !containertypes.Isolation.IsHyperV(actualIsolation) {
+		if err := daemon.Mount(container); err == nil {
+			defer daemon.Unmount(container)
+		}
 	}
 
 	if container.IsRunning() {

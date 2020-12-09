@@ -3,7 +3,6 @@ package distribution // import "github.com/docker/docker/distribution"
 import (
 	"context"
 	"fmt"
-	"runtime"
 
 	"github.com/docker/distribution/reference"
 	"github.com/docker/docker/api"
@@ -11,7 +10,8 @@ import (
 	"github.com/docker/docker/pkg/progress"
 	refstore "github.com/docker/docker/reference"
 	"github.com/docker/docker/registry"
-	"github.com/opencontainers/go-digest"
+	digest "github.com/opencontainers/go-digest"
+	specs "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 )
@@ -21,7 +21,7 @@ type Puller interface {
 	// Pull tries to pull the image referenced by `tag`
 	// Pull returns an error if any, as well as a boolean that determines whether to retry Pull on the next configured endpoint.
 	//
-	Pull(ctx context.Context, ref reference.Named, os string) error
+	Pull(ctx context.Context, ref reference.Named, platform *specs.Platform) error
 }
 
 // newPuller returns a Puller interface that will pull from either a v1 or v2
@@ -29,7 +29,7 @@ type Puller interface {
 // whether a v1 or v2 puller will be created. The other parameters are passed
 // through to the underlying puller implementation for use during the actual
 // pull operation.
-func newPuller(endpoint registry.APIEndpoint, repoInfo *registry.RepositoryInfo, imagePullConfig *ImagePullConfig) (Puller, error) {
+func newPuller(endpoint registry.APIEndpoint, repoInfo *registry.RepositoryInfo, imagePullConfig *ImagePullConfig, local ContentStore) (Puller, error) {
 	switch endpoint.Version {
 	case registry.APIVersion2:
 		return &v2Puller{
@@ -37,21 +37,19 @@ func newPuller(endpoint registry.APIEndpoint, repoInfo *registry.RepositoryInfo,
 			endpoint:          endpoint,
 			config:            imagePullConfig,
 			repoInfo:          repoInfo,
+			manifestStore: &manifestStore{
+				local: local,
+			},
 		}, nil
 	case registry.APIVersion1:
-		return &v1Puller{
-			v1IDService: metadata.NewV1IDService(imagePullConfig.MetadataStore),
-			endpoint:    endpoint,
-			config:      imagePullConfig,
-			repoInfo:    repoInfo,
-		}, nil
+		return nil, fmt.Errorf("protocol version %d no longer supported. Please contact admins of registry %s", endpoint.Version, endpoint.URL)
 	}
 	return nil, fmt.Errorf("unknown version %d for registry %s", endpoint.Version, endpoint.URL)
 }
 
 // Pull initiates a pull operation. image is the repository name to pull, and
 // tag may be either empty, or indicate a specific tag to pull.
-func Pull(ctx context.Context, ref reference.Named, imagePullConfig *ImagePullConfig) error {
+func Pull(ctx context.Context, ref reference.Named, imagePullConfig *ImagePullConfig, local ContentStore) error {
 	// Resolve the Repository name from fqn to RepositoryInfo
 	repoInfo, err := imagePullConfig.RegistryService.ResolveRepository(ref)
 	if err != nil {
@@ -109,18 +107,13 @@ func Pull(ctx context.Context, ref reference.Named, imagePullConfig *ImagePullCo
 
 		logrus.Debugf("Trying to pull %s from %s %s", reference.FamiliarName(repoInfo.Name), endpoint.URL, endpoint.Version)
 
-		puller, err := newPuller(endpoint, repoInfo, imagePullConfig)
+		puller, err := newPuller(endpoint, repoInfo, imagePullConfig, local)
 		if err != nil {
 			lastErr = err
 			continue
 		}
 
-		// Make sure we default the OS if it hasn't been supplied
-		if imagePullConfig.OS == "" {
-			imagePullConfig.OS = runtime.GOOS
-		}
-
-		if err := puller.Pull(ctx, ref, imagePullConfig.OS); err != nil {
+		if err := puller.Pull(ctx, ref, imagePullConfig.Platform); err != nil {
 			// Was this pull cancelled? If so, don't try to fall
 			// back.
 			fallback := false

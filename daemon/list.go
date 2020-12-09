@@ -12,18 +12,10 @@ import (
 	"github.com/docker/docker/daemon/images"
 	"github.com/docker/docker/errdefs"
 	"github.com/docker/docker/image"
-	"github.com/docker/docker/volume"
 	"github.com/docker/go-connections/nat"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 )
-
-var acceptedVolumeFilterTags = map[string]bool{
-	"dangling": true,
-	"name":     true,
-	"driver":   true,
-	"label":    true,
-}
 
 var acceptedPsFilterTags = map[string]bool{
 	"ancestor":  true,
@@ -85,12 +77,12 @@ type listContext struct {
 
 	// beforeFilter is a filter to ignore containers that appear before the one given
 	beforeFilter *container.Snapshot
-	// sinceFilter is a filter to stop the filtering when the iterator arrive to the given container
+	// sinceFilter is a filter to stop the filtering when the iterator arrives to the given container
 	sinceFilter *container.Snapshot
 
-	// taskFilter tells if we should filter based on wether a container is part of a task
+	// taskFilter tells if we should filter based on whether a container is part of a task
 	taskFilter bool
-	// isTask tells us if the we should filter container that are a task (true) or not (false)
+	// isTask tells us if we should filter container that is a task (true) or not (false)
 	isTask bool
 
 	// publish is a list of published ports to filter with
@@ -154,7 +146,8 @@ func (daemon *Daemon) filterByNameIDMatches(view container.View, ctx *listContex
 				continue
 			}
 			for _, eachName := range idNames {
-				if ctx.filters.Match("name", eachName) {
+				// match both on container name with, and without slash-prefix
+				if ctx.filters.Match("name", eachName) || ctx.filters.Match("name", strings.TrimPrefix(eachName, "/")) {
 					matches[id] = true
 				}
 			}
@@ -324,7 +317,7 @@ func (daemon *Daemon) foldFilter(view container.View, config *types.ContainerLis
 	if psFilters.Contains("ancestor") {
 		ancestorFilter = true
 		psFilters.WalkValues("ancestor", func(ancestor string) error {
-			img, err := daemon.imageService.GetImage(ancestor)
+			img, err := daemon.imageService.GetImage(ancestor, nil)
 			if err != nil {
 				logrus.Warnf("Error while looking up for image %v", ancestor)
 				return nil
@@ -395,7 +388,7 @@ func portOp(key string, filter map[nat.Port]bool) func(value string) error {
 		if strings.Contains(value, ":") {
 			return fmt.Errorf("filter for '%s' should not contain ':': %s", key, value)
 		}
-		//support two formats, original format <portnum>/[<proto>] or <startport-endport>/[<proto>]
+		// support two formats, original format <portnum>/[<proto>] or <startport-endport>/[<proto>]
 		proto, port := nat.SplitProtoPort(value)
 		start, end, err := nat.ParsePortRange(port)
 		if err != nil {
@@ -437,7 +430,7 @@ func includeContainerInList(container *container.Snapshot, ctx *listContext) ite
 	}
 
 	// Do not include container if the name doesn't match
-	if !ctx.filters.Match("name", container.Name) {
+	if !ctx.filters.Match("name", container.Name) && !ctx.filters.Match("name", strings.TrimPrefix(container.Name, "/")) {
 		return excludeContainer
 	}
 
@@ -558,23 +551,19 @@ func includeContainerInList(container *container.Snapshot, ctx *listContext) ite
 		}
 	}
 
-	if len(ctx.publish) > 0 {
-		shouldSkip := true
-		for port := range ctx.publish {
-			if _, ok := container.PortBindings[port]; ok {
+	if len(ctx.expose) > 0 || len(ctx.publish) > 0 {
+		var (
+			shouldSkip    bool = true
+			publishedPort nat.Port
+			exposedPort   nat.Port
+		)
+		for _, port := range container.Ports {
+			publishedPort = nat.Port(fmt.Sprintf("%d/%s", port.PublicPort, port.Type))
+			exposedPort = nat.Port(fmt.Sprintf("%d/%s", port.PrivatePort, port.Type))
+			if ok := ctx.publish[publishedPort]; ok {
 				shouldSkip = false
 				break
-			}
-		}
-		if shouldSkip {
-			return excludeContainer
-		}
-	}
-
-	if len(ctx.expose) > 0 {
-		shouldSkip := true
-		for port := range ctx.expose {
-			if _, ok := container.ExposedPorts[port]; ok {
+			} else if ok := ctx.expose[exposedPort]; ok {
 				shouldSkip = false
 				break
 			}
@@ -592,7 +581,7 @@ func (daemon *Daemon) refreshImage(s *container.Snapshot, ctx *listContext) (*ty
 	c := s.Container
 	image := s.Image // keep the original ref if still valid (hasn't changed)
 	if image != s.ImageID {
-		img, err := daemon.imageService.GetImage(image)
+		img, err := daemon.imageService.GetImage(image, nil)
 		if _, isDNE := err.(images.ErrImageDoesNotExist); err != nil && !isDNE {
 			return nil, err
 		}
@@ -603,87 +592,6 @@ func (daemon *Daemon) refreshImage(s *container.Snapshot, ctx *listContext) (*ty
 	}
 	c.Image = image
 	return &c, nil
-}
-
-// Volumes lists known volumes, using the filter to restrict the range
-// of volumes returned.
-func (daemon *Daemon) Volumes(filter string) ([]*types.Volume, []string, error) {
-	var (
-		volumesOut []*types.Volume
-	)
-	volFilters, err := filters.FromJSON(filter)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	if err := volFilters.Validate(acceptedVolumeFilterTags); err != nil {
-		return nil, nil, err
-	}
-
-	volumes, warnings, err := daemon.volumes.List()
-	if err != nil {
-		return nil, nil, err
-	}
-
-	filterVolumes, err := daemon.filterVolumes(volumes, volFilters)
-	if err != nil {
-		return nil, nil, err
-	}
-	for _, v := range filterVolumes {
-		apiV := volumeToAPIType(v)
-		if vv, ok := v.(interface {
-			CachedPath() string
-		}); ok {
-			apiV.Mountpoint = vv.CachedPath()
-		} else {
-			apiV.Mountpoint = v.Path()
-		}
-		volumesOut = append(volumesOut, apiV)
-	}
-	return volumesOut, warnings, nil
-}
-
-// filterVolumes filters volume list according to user specified filter
-// and returns user chosen volumes
-func (daemon *Daemon) filterVolumes(vols []volume.Volume, filter filters.Args) ([]volume.Volume, error) {
-	// if filter is empty, return original volume list
-	if filter.Len() == 0 {
-		return vols, nil
-	}
-
-	var retVols []volume.Volume
-	for _, vol := range vols {
-		if filter.Contains("name") {
-			if !filter.Match("name", vol.Name()) {
-				continue
-			}
-		}
-		if filter.Contains("driver") {
-			if !filter.ExactMatch("driver", vol.DriverName()) {
-				continue
-			}
-		}
-		if filter.Contains("label") {
-			v, ok := vol.(volume.DetailedVolume)
-			if !ok {
-				continue
-			}
-			if !filter.MatchKVList("label", v.Labels()) {
-				continue
-			}
-		}
-		retVols = append(retVols, vol)
-	}
-	danglingOnly := false
-	if filter.Contains("dangling") {
-		if filter.ExactMatch("dangling", "true") || filter.ExactMatch("dangling", "1") {
-			danglingOnly = true
-		} else if !filter.ExactMatch("dangling", "false") && !filter.ExactMatch("dangling", "0") {
-			return nil, invalidFilter{"dangling", filter.Get("dangling")}
-		}
-		retVols = daemon.volumes.FilterByUsed(retVols, !danglingOnly)
-	}
-	return retVols, nil
 }
 
 func populateImageFilterByParents(ancestorMap map[image.ID]bool, imageID image.ID, getChildren func(image.ID) []image.ID) {

@@ -12,6 +12,7 @@ import (
 
 	"github.com/docker/docker/api/types"
 	volumetypes "github.com/docker/docker/api/types/volume"
+	"github.com/docker/docker/errdefs"
 )
 
 func TestVolumeCreateError(t *testing.T) {
@@ -19,9 +20,9 @@ func TestVolumeCreateError(t *testing.T) {
 		client: newMockClient(errorMock(http.StatusInternalServerError, "Server error")),
 	}
 
-	_, err := client.VolumeCreate(context.Background(), volumetypes.VolumesCreateBody{})
-	if err == nil || err.Error() != "Error response from daemon: Server error" {
-		t.Fatalf("expected a Server Error, got %v", err)
+	_, err := client.VolumeCreate(context.Background(), volumetypes.VolumeCreateBody{})
+	if !errdefs.IsSystem(err) {
+		t.Fatalf("expected a Server Error, got %[1]T: %[1]v", err)
 	}
 }
 
@@ -34,7 +35,7 @@ func TestVolumeCreate(t *testing.T) {
 				return nil, fmt.Errorf("Expected URL '%s', got '%s'", expectedURL, req.URL)
 			}
 
-			if req.Method != "POST" {
+			if req.Method != http.MethodPost {
 				return nil, fmt.Errorf("expected POST method, got %s", req.Method)
 			}
 
@@ -53,7 +54,7 @@ func TestVolumeCreate(t *testing.T) {
 		}),
 	}
 
-	volume, err := client.VolumeCreate(context.Background(), volumetypes.VolumesCreateBody{
+	volume, err := client.VolumeCreate(context.Background(), volumetypes.VolumeCreateBody{
 		Name:   "myvolume",
 		Driver: "mydriver",
 		DriverOpts: map[string]string{

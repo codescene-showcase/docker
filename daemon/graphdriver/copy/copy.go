@@ -2,14 +2,6 @@
 
 package copy // import "github.com/docker/docker/daemon/graphdriver/copy"
 
-/*
-#include <linux/fs.h>
-
-#ifndef FICLONE
-#define FICLONE		_IOW(0x94, 9, int)
-#endif
-*/
-import "C"
 import (
 	"container/list"
 	"fmt"
@@ -19,9 +11,9 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/containerd/containerd/sys"
 	"github.com/docker/docker/pkg/pools"
 	"github.com/docker/docker/pkg/system"
-	rsystem "github.com/opencontainers/runc/libcontainer/system"
 	"golang.org/x/sys/unix"
 )
 
@@ -50,7 +42,7 @@ func copyRegular(srcPath, dstPath string, fileinfo os.FileInfo, copyWithFileRang
 	defer dstFile.Close()
 
 	if *copyWithFileClone {
-		_, _, err = unix.Syscall(unix.SYS_IOCTL, dstFile.Fd(), C.FICLONE, srcFile.Fd())
+		err = unix.IoctlFileClone(int(dstFile.Fd()), int(srcFile.Fd()))
 		if err == nil {
 			return nil
 		}
@@ -141,9 +133,6 @@ func DirCopy(srcDir, dstDir string, copyMode Mode, copyXattrs bool) error {
 		}
 
 		dstPath := filepath.Join(dstDir, relPath)
-		if err != nil {
-			return err
-		}
 
 		stat, ok := f.Sys().(*syscall.Stat_t)
 		if !ok {
@@ -152,9 +141,10 @@ func DirCopy(srcDir, dstDir string, copyMode Mode, copyXattrs bool) error {
 
 		isHardlink := false
 
-		switch f.Mode() & os.ModeType {
-		case 0: // Regular file
-			id := fileID{dev: stat.Dev, ino: stat.Ino}
+		switch mode := f.Mode(); {
+		case mode.IsRegular():
+			// the type is 32bit on mips
+			id := fileID{dev: uint64(stat.Dev), ino: stat.Ino} // nolint: unconvert
 			if copyMode == Hardlink {
 				isHardlink = true
 				if err2 := os.Link(srcPath, dstPath); err2 != nil {
@@ -171,12 +161,12 @@ func DirCopy(srcDir, dstDir string, copyMode Mode, copyXattrs bool) error {
 				copiedFiles[id] = dstPath
 			}
 
-		case os.ModeDir:
+		case mode.IsDir():
 			if err := os.Mkdir(dstPath, f.Mode()); err != nil && !os.IsExist(err) {
 				return err
 			}
 
-		case os.ModeSymlink:
+		case mode&os.ModeSymlink != 0:
 			link, err := os.Readlink(srcPath)
 			if err != nil {
 				return err
@@ -186,15 +176,15 @@ func DirCopy(srcDir, dstDir string, copyMode Mode, copyXattrs bool) error {
 				return err
 			}
 
-		case os.ModeNamedPipe:
+		case mode&os.ModeNamedPipe != 0:
 			fallthrough
-		case os.ModeSocket:
+		case mode&os.ModeSocket != 0:
 			if err := unix.Mkfifo(dstPath, stat.Mode); err != nil {
 				return err
 			}
 
-		case os.ModeDevice:
-			if rsystem.RunningInUserNS() {
+		case mode&os.ModeDevice != 0:
+			if sys.RunningInUserNS() {
 				// cannot create a device if running in user namespace
 				return nil
 			}
@@ -203,7 +193,7 @@ func DirCopy(srcDir, dstDir string, copyMode Mode, copyXattrs bool) error {
 			}
 
 		default:
-			return fmt.Errorf("unknown file type for %s", srcPath)
+			return fmt.Errorf("unknown file type (%d / %s) for %s", f.Mode(), f.Mode().String(), srcPath)
 		}
 
 		// Everything below is copying metadata from src to dst. All this metadata

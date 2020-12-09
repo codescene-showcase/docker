@@ -9,8 +9,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/gotestyourself/gotestyourself/assert"
-	is "github.com/gotestyourself/gotestyourself/assert/cmp"
+	"github.com/docker/docker/errdefs"
+	"gotest.tools/v3/assert"
+	is "gotest.tools/v3/assert/cmp"
 )
 
 func TestSecretRemoveUnsupported(t *testing.T) {
@@ -29,8 +30,8 @@ func TestSecretRemoveError(t *testing.T) {
 	}
 
 	err := client.SecretRemove(context.Background(), "secret_id")
-	if err == nil || err.Error() != "Error response from daemon: Server error" {
-		t.Fatalf("expected a Server Error, got %v", err)
+	if !errdefs.IsSystem(err) {
+		t.Fatalf("expected a Server Error, got %[1]T: %[1]v", err)
 	}
 }
 
@@ -43,7 +44,7 @@ func TestSecretRemove(t *testing.T) {
 			if !strings.HasPrefix(req.URL.Path, expectedURL) {
 				return nil, fmt.Errorf("Expected URL '%s', got '%s'", expectedURL, req.URL)
 			}
-			if req.Method != "DELETE" {
+			if req.Method != http.MethodDelete {
 				return nil, fmt.Errorf("expected DELETE method, got %s", req.Method)
 			}
 			return &http.Response{

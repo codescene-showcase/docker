@@ -7,8 +7,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/pkg/errors"
-
+	"github.com/containerd/containerd/platforms"
 	"github.com/docker/docker/api/types"
 	containertypes "github.com/docker/docker/api/types/container"
 	networktypes "github.com/docker/docker/api/types/network"
@@ -16,82 +15,123 @@ import (
 	"github.com/docker/docker/errdefs"
 	"github.com/docker/docker/image"
 	"github.com/docker/docker/pkg/idtools"
-	"github.com/docker/docker/pkg/stringid"
 	"github.com/docker/docker/pkg/system"
 	"github.com/docker/docker/runconfig"
-	"github.com/opencontainers/selinux/go-selinux/label"
+	v1 "github.com/opencontainers/image-spec/specs-go/v1"
+	"github.com/opencontainers/selinux/go-selinux"
+	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 )
 
+type createOpts struct {
+	params                  types.ContainerCreateConfig
+	managed                 bool
+	ignoreImagesArgsEscaped bool
+}
+
 // CreateManagedContainer creates a container that is managed by a Service
 func (daemon *Daemon) CreateManagedContainer(params types.ContainerCreateConfig) (containertypes.ContainerCreateCreatedBody, error) {
-	return daemon.containerCreate(params, true)
+	return daemon.containerCreate(createOpts{
+		params:                  params,
+		managed:                 true,
+		ignoreImagesArgsEscaped: false})
 }
 
 // ContainerCreate creates a regular container
 func (daemon *Daemon) ContainerCreate(params types.ContainerCreateConfig) (containertypes.ContainerCreateCreatedBody, error) {
-	return daemon.containerCreate(params, false)
+	return daemon.containerCreate(createOpts{
+		params:                  params,
+		managed:                 false,
+		ignoreImagesArgsEscaped: false})
 }
 
-func (daemon *Daemon) containerCreate(params types.ContainerCreateConfig, managed bool) (containertypes.ContainerCreateCreatedBody, error) {
+// ContainerCreateIgnoreImagesArgsEscaped creates a regular container. This is called from the builder RUN case
+// and ensures that we do not take the images ArgsEscaped
+func (daemon *Daemon) ContainerCreateIgnoreImagesArgsEscaped(params types.ContainerCreateConfig) (containertypes.ContainerCreateCreatedBody, error) {
+	return daemon.containerCreate(createOpts{
+		params:                  params,
+		managed:                 false,
+		ignoreImagesArgsEscaped: true})
+}
+
+func (daemon *Daemon) containerCreate(opts createOpts) (containertypes.ContainerCreateCreatedBody, error) {
 	start := time.Now()
-	if params.Config == nil {
+	if opts.params.Config == nil {
 		return containertypes.ContainerCreateCreatedBody{}, errdefs.InvalidParameter(errors.New("Config cannot be empty in order to create a container"))
 	}
 
 	os := runtime.GOOS
-	if params.Config.Image != "" {
-		img, err := daemon.imageService.GetImage(params.Config.Image)
+	var img *image.Image
+	if opts.params.Config.Image != "" {
+		var err error
+		img, err = daemon.imageService.GetImage(opts.params.Config.Image, opts.params.Platform)
 		if err == nil {
 			os = img.OS
 		}
 	} else {
 		// This mean scratch. On Windows, we can safely assume that this is a linux
 		// container. On other platforms, it's the host OS (which it already is)
-		if runtime.GOOS == "windows" && system.LCOWSupported() {
+		if isWindows && system.LCOWSupported() {
 			os = "linux"
 		}
 	}
 
-	warnings, err := daemon.verifyContainerSettings(os, params.HostConfig, params.Config, false)
+	warnings, err := daemon.verifyContainerSettings(os, opts.params.HostConfig, opts.params.Config, false)
 	if err != nil {
 		return containertypes.ContainerCreateCreatedBody{Warnings: warnings}, errdefs.InvalidParameter(err)
 	}
 
-	err = verifyNetworkingConfig(params.NetworkingConfig)
+	if img != nil && opts.params.Platform == nil {
+		p := platforms.DefaultSpec()
+		imgPlat := v1.Platform{
+			OS:           img.OS,
+			Architecture: img.Architecture,
+			Variant:      img.Variant,
+		}
+
+		if !platforms.Only(p).Match(imgPlat) {
+			warnings = append(warnings, fmt.Sprintf("The requested image's platform (%s) does not match the detected host platform (%s) and no specific platform was requested", platforms.Format(imgPlat), platforms.Format(p)))
+		}
+	}
+
+	err = verifyNetworkingConfig(opts.params.NetworkingConfig)
 	if err != nil {
 		return containertypes.ContainerCreateCreatedBody{Warnings: warnings}, errdefs.InvalidParameter(err)
 	}
 
-	if params.HostConfig == nil {
-		params.HostConfig = &containertypes.HostConfig{}
+	if opts.params.HostConfig == nil {
+		opts.params.HostConfig = &containertypes.HostConfig{}
 	}
-	err = daemon.adaptContainerSettings(params.HostConfig, params.AdjustCPUShares)
+	err = daemon.adaptContainerSettings(opts.params.HostConfig, opts.params.AdjustCPUShares)
 	if err != nil {
 		return containertypes.ContainerCreateCreatedBody{Warnings: warnings}, errdefs.InvalidParameter(err)
 	}
 
-	container, err := daemon.create(params, managed)
+	ctr, err := daemon.create(opts)
 	if err != nil {
 		return containertypes.ContainerCreateCreatedBody{Warnings: warnings}, err
 	}
 	containerActions.WithValues("create").UpdateSince(start)
 
-	return containertypes.ContainerCreateCreatedBody{ID: container.ID, Warnings: warnings}, nil
+	if warnings == nil {
+		warnings = make([]string, 0) // Create an empty slice to avoid https://github.com/moby/moby/issues/38222
+	}
+
+	return containertypes.ContainerCreateCreatedBody{ID: ctr.ID, Warnings: warnings}, nil
 }
 
 // Create creates a new container from the given configuration with a given name.
-func (daemon *Daemon) create(params types.ContainerCreateConfig, managed bool) (retC *container.Container, retErr error) {
+func (daemon *Daemon) create(opts createOpts) (retC *container.Container, retErr error) {
 	var (
-		container *container.Container
-		img       *image.Image
-		imgID     image.ID
-		err       error
+		ctr   *container.Container
+		img   *image.Image
+		imgID image.ID
+		err   error
 	)
 
 	os := runtime.GOOS
-	if params.Config.Image != "" {
-		img, err = daemon.imageService.GetImage(params.Config.Image)
+	if opts.params.Config.Image != "" {
+		img, err = daemon.imageService.GetImage(opts.params.Config.Image, opts.params.Platform)
 		if err != nil {
 			return nil, err
 		}
@@ -99,101 +139,110 @@ func (daemon *Daemon) create(params types.ContainerCreateConfig, managed bool) (
 			os = img.OS
 		} else {
 			// default to the host OS except on Windows with LCOW
-			if runtime.GOOS == "windows" && system.LCOWSupported() {
+			if isWindows && system.LCOWSupported() {
 				os = "linux"
 			}
 		}
 		imgID = img.ID()
 
-		if runtime.GOOS == "windows" && img.OS == "linux" && !system.LCOWSupported() {
+		if isWindows && img.OS == "linux" && !system.LCOWSupported() {
 			return nil, errors.New("operating system on which parent image was created is not Windows")
 		}
 	} else {
-		if runtime.GOOS == "windows" {
+		if isWindows {
 			os = "linux" // 'scratch' case.
 		}
 	}
 
-	if err := daemon.mergeAndVerifyConfig(params.Config, img); err != nil {
+	// On WCOW, if are not being invoked by the builder to create this container (where
+	// ignoreImagesArgEscaped will be true) - if the image already has its arguments escaped,
+	// ensure that this is replicated across to the created container to avoid double-escaping
+	// of the arguments/command line when the runtime attempts to run the container.
+	if os == "windows" && !opts.ignoreImagesArgsEscaped && img != nil && img.RunConfig().ArgsEscaped {
+		opts.params.Config.ArgsEscaped = true
+	}
+
+	if err := daemon.mergeAndVerifyConfig(opts.params.Config, img); err != nil {
 		return nil, errdefs.InvalidParameter(err)
 	}
 
-	if err := daemon.mergeAndVerifyLogConfig(&params.HostConfig.LogConfig); err != nil {
+	if err := daemon.mergeAndVerifyLogConfig(&opts.params.HostConfig.LogConfig); err != nil {
 		return nil, errdefs.InvalidParameter(err)
 	}
 
-	if container, err = daemon.newContainer(params.Name, os, params.Config, params.HostConfig, imgID, managed); err != nil {
+	if ctr, err = daemon.newContainer(opts.params.Name, os, opts.params.Config, opts.params.HostConfig, imgID, opts.managed); err != nil {
 		return nil, err
 	}
 	defer func() {
 		if retErr != nil {
-			if err := daemon.cleanupContainer(container, true, true); err != nil {
+			if err := daemon.cleanupContainer(ctr, true, true); err != nil {
 				logrus.Errorf("failed to cleanup container on create error: %v", err)
 			}
 		}
 	}()
 
-	if err := daemon.setSecurityOptions(container, params.HostConfig); err != nil {
+	if err := daemon.setSecurityOptions(ctr, opts.params.HostConfig); err != nil {
 		return nil, err
 	}
 
-	container.HostConfig.StorageOpt = params.HostConfig.StorageOpt
+	ctr.HostConfig.StorageOpt = opts.params.HostConfig.StorageOpt
 
 	// Fixes: https://github.com/moby/moby/issues/34074 and
 	// https://github.com/docker/for-win/issues/999.
 	// Merge the daemon's storage options if they aren't already present. We only
 	// do this on Windows as there's no effective sandbox size limit other than
 	// physical on Linux.
-	if runtime.GOOS == "windows" {
-		if container.HostConfig.StorageOpt == nil {
-			container.HostConfig.StorageOpt = make(map[string]string)
+	if isWindows {
+		if ctr.HostConfig.StorageOpt == nil {
+			ctr.HostConfig.StorageOpt = make(map[string]string)
 		}
 		for _, v := range daemon.configStore.GraphOptions {
 			opt := strings.SplitN(v, "=", 2)
-			if _, ok := container.HostConfig.StorageOpt[opt[0]]; !ok {
-				container.HostConfig.StorageOpt[opt[0]] = opt[1]
+			if _, ok := ctr.HostConfig.StorageOpt[opt[0]]; !ok {
+				ctr.HostConfig.StorageOpt[opt[0]] = opt[1]
 			}
 		}
 	}
 
 	// Set RWLayer for container after mount labels have been set
-	rwLayer, err := daemon.imageService.CreateLayer(container, setupInitLayer(daemon.idMappings))
+	rwLayer, err := daemon.imageService.CreateLayer(ctr, setupInitLayer(daemon.idMapping))
 	if err != nil {
 		return nil, errdefs.System(err)
 	}
-	container.RWLayer = rwLayer
+	ctr.RWLayer = rwLayer
 
-	rootIDs := daemon.idMappings.RootPair()
-	if err := idtools.MkdirAndChown(container.Root, 0700, rootIDs); err != nil {
+	rootIDs := daemon.idMapping.RootPair()
+
+	if err := idtools.MkdirAndChown(ctr.Root, 0700, rootIDs); err != nil {
 		return nil, err
 	}
-	if err := idtools.MkdirAndChown(container.CheckpointDir(), 0700, rootIDs); err != nil {
-		return nil, err
-	}
-
-	if err := daemon.setHostConfig(container, params.HostConfig); err != nil {
+	if err := idtools.MkdirAndChown(ctr.CheckpointDir(), 0700, rootIDs); err != nil {
 		return nil, err
 	}
 
-	if err := daemon.createContainerOSSpecificSettings(container, params.Config, params.HostConfig); err != nil {
+	if err := daemon.setHostConfig(ctr, opts.params.HostConfig); err != nil {
+		return nil, err
+	}
+
+	if err := daemon.createContainerOSSpecificSettings(ctr, opts.params.Config, opts.params.HostConfig); err != nil {
 		return nil, err
 	}
 
 	var endpointsConfigs map[string]*networktypes.EndpointSettings
-	if params.NetworkingConfig != nil {
-		endpointsConfigs = params.NetworkingConfig.EndpointsConfig
+	if opts.params.NetworkingConfig != nil {
+		endpointsConfigs = opts.params.NetworkingConfig.EndpointsConfig
 	}
 	// Make sure NetworkMode has an acceptable value. We do this to ensure
 	// backwards API compatibility.
-	runconfig.SetDefaultNetModeIfBlank(container.HostConfig)
+	runconfig.SetDefaultNetModeIfBlank(ctr.HostConfig)
 
-	daemon.updateContainerNetworkSettings(container, endpointsConfigs)
-	if err := daemon.Register(container); err != nil {
+	daemon.updateContainerNetworkSettings(ctr, endpointsConfigs)
+	if err := daemon.Register(ctr); err != nil {
 		return nil, err
 	}
-	stateCtr.set(container.ID, "stopped")
-	daemon.LogContainerEvent(container, "create")
-	return container, nil
+	stateCtr.set(ctr.ID, "stopped")
+	daemon.LogContainerEvent(ctr, "create")
+	return ctr, nil
 }
 
 func toHostConfigSelinuxLabels(labels []string) []string {
@@ -215,7 +264,7 @@ func (daemon *Daemon) generateSecurityOpt(hostConfig *containertypes.HostConfig)
 	pidMode := hostConfig.PidMode
 	privileged := hostConfig.Privileged
 	if ipcMode.IsHost() || pidMode.IsHost() || privileged {
-		return toHostConfigSelinuxLabels(label.DisableSecOpt()), nil
+		return toHostConfigSelinuxLabels(selinux.DisableSecOpt()), nil
 	}
 
 	var ipcLabel []string
@@ -227,7 +276,10 @@ func (daemon *Daemon) generateSecurityOpt(hostConfig *containertypes.HostConfig)
 		if err != nil {
 			return nil, err
 		}
-		ipcLabel = label.DupSecOpt(c.ProcessLabel)
+		ipcLabel, err = selinux.DupSecOpt(c.ProcessLabel)
+		if err != nil {
+			return nil, err
+		}
 		if pidContainer == "" {
 			return toHostConfigSelinuxLabels(ipcLabel), err
 		}
@@ -238,7 +290,10 @@ func (daemon *Daemon) generateSecurityOpt(hostConfig *containertypes.HostConfig)
 			return nil, err
 		}
 
-		pidLabel = label.DupSecOpt(c.ProcessLabel)
+		pidLabel, err = selinux.DupSecOpt(c.ProcessLabel)
+		if err != nil {
+			return nil, err
+		}
 		if ipcContainer == "" {
 			return toHostConfigSelinuxLabels(pidLabel), err
 		}
@@ -253,24 +308,6 @@ func (daemon *Daemon) generateSecurityOpt(hostConfig *containertypes.HostConfig)
 		return toHostConfigSelinuxLabels(pidLabel), nil
 	}
 	return nil, nil
-}
-
-// VolumeCreate creates a volume with the specified name, driver, and opts
-// This is called directly from the Engine API
-func (daemon *Daemon) VolumeCreate(name, driverName string, opts, labels map[string]string) (*types.Volume, error) {
-	if name == "" {
-		name = stringid.GenerateNonCryptoID()
-	}
-
-	v, err := daemon.volumes.Create(name, driverName, opts, labels)
-	if err != nil {
-		return nil, err
-	}
-
-	daemon.LogVolumeEvent(v.Name(), "create", map[string]string{"driver": v.DriverName()})
-	apiV := volumeToAPIType(v)
-	apiV.Mountpoint = v.Path()
-	return apiV, nil
 }
 
 func (daemon *Daemon) mergeAndVerifyConfig(config *containertypes.Config, img *image.Image) error {
@@ -295,30 +332,31 @@ func verifyNetworkingConfig(nwConfig *networktypes.NetworkingConfig) error {
 	if nwConfig == nil || len(nwConfig.EndpointsConfig) == 0 {
 		return nil
 	}
-	if len(nwConfig.EndpointsConfig) == 1 {
-		for k, v := range nwConfig.EndpointsConfig {
-			if v == nil {
-				return errdefs.InvalidParameter(errors.Errorf("no EndpointSettings for %s", k))
+	if len(nwConfig.EndpointsConfig) > 1 {
+		l := make([]string, 0, len(nwConfig.EndpointsConfig))
+		for k := range nwConfig.EndpointsConfig {
+			l = append(l, k)
+		}
+		return errors.Errorf("Container cannot be connected to network endpoints: %s", strings.Join(l, ", "))
+	}
+
+	for k, v := range nwConfig.EndpointsConfig {
+		if v == nil {
+			return errdefs.InvalidParameter(errors.Errorf("no EndpointSettings for %s", k))
+		}
+		if v.IPAMConfig != nil {
+			if v.IPAMConfig.IPv4Address != "" && net.ParseIP(v.IPAMConfig.IPv4Address).To4() == nil {
+				return errors.Errorf("invalid IPv4 address: %s", v.IPAMConfig.IPv4Address)
 			}
-			if v.IPAMConfig != nil {
-				if v.IPAMConfig.IPv4Address != "" && net.ParseIP(v.IPAMConfig.IPv4Address).To4() == nil {
-					return errors.Errorf("invalid IPv4 address: %s", v.IPAMConfig.IPv4Address)
-				}
-				if v.IPAMConfig.IPv6Address != "" {
-					n := net.ParseIP(v.IPAMConfig.IPv6Address)
-					// if the address is an invalid network address (ParseIP == nil) or if it is
-					// an IPv4 address (To4() != nil), then it is an invalid IPv6 address
-					if n == nil || n.To4() != nil {
-						return errors.Errorf("invalid IPv6 address: %s", v.IPAMConfig.IPv6Address)
-					}
+			if v.IPAMConfig.IPv6Address != "" {
+				n := net.ParseIP(v.IPAMConfig.IPv6Address)
+				// if the address is an invalid network address (ParseIP == nil) or if it is
+				// an IPv4 address (To4() != nil), then it is an invalid IPv6 address
+				if n == nil || n.To4() != nil {
+					return errors.Errorf("invalid IPv6 address: %s", v.IPAMConfig.IPv6Address)
 				}
 			}
 		}
-		return nil
 	}
-	l := make([]string, 0, len(nwConfig.EndpointsConfig))
-	for k := range nwConfig.EndpointsConfig {
-		l = append(l, k)
-	}
-	return errors.Errorf("Container cannot be connected to network endpoints: %s", strings.Join(l, ", "))
+	return nil
 }

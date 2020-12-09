@@ -17,6 +17,8 @@ import (
 var (
 	// ErrUnsupportedRuntime returns an error if the runtime is not supported by the daemon
 	ErrUnsupportedRuntime = errors.New("unsupported runtime")
+	// ErrMismatchedRuntime returns an error if the runtime does not match the provided spec
+	ErrMismatchedRuntime = errors.New("mismatched Runtime and *Spec fields")
 )
 
 // ServiceFromGRPC converts a grpc Service to a Service.
@@ -41,6 +43,15 @@ func ServiceFromGRPC(s swarmapi.Service) (types.Service, error) {
 	service.Version.Index = s.Meta.Version.Index
 	service.CreatedAt, _ = gogotypes.TimestampFromProto(s.Meta.CreatedAt)
 	service.UpdatedAt, _ = gogotypes.TimestampFromProto(s.Meta.UpdatedAt)
+
+	if s.JobStatus != nil {
+		service.JobStatus = &types.JobStatus{
+			JobIteration: types.Version{
+				Index: s.JobStatus.JobIteration.Index,
+			},
+		}
+		service.JobStatus.LastExecution, _ = gogotypes.TimestampFromProto(s.JobStatus.LastExecution)
+	}
 
 	// UpdateStatus
 	if s.UpdateStatus != nil {
@@ -129,6 +140,13 @@ func serviceSpecFromGRPC(spec *swarmapi.ServiceSpec) (*types.ServiceSpec, error)
 		convertedSpec.Mode.Replicated = &types.ReplicatedService{
 			Replicas: &t.Replicated.Replicas,
 		}
+	case *swarmapi.ServiceSpec_ReplicatedJob:
+		convertedSpec.Mode.ReplicatedJob = &types.ReplicatedJob{
+			MaxConcurrent:    &t.ReplicatedJob.MaxConcurrent,
+			TotalCompletions: &t.ReplicatedJob.TotalCompletions,
+		}
+	case *swarmapi.ServiceSpec_GlobalJob:
+		convertedSpec.Mode.GlobalJob = &types.GlobalJob{}
 	}
 
 	return convertedSpec, nil
@@ -175,16 +193,23 @@ func ServiceSpecToGRPC(s types.ServiceSpec) (swarmapi.ServiceSpec, error) {
 			if err != nil {
 				return swarmapi.ServiceSpec{}, err
 			}
+			if s.TaskTemplate.Resources != nil && s.TaskTemplate.Resources.Limits != nil {
+				// TODO remove this (or keep for backward compat) once SwarmKit API moved PidsLimit into Resources
+				containerSpec.PidsLimit = s.TaskTemplate.Resources.Limits.Pids
+			}
 			spec.Task.Runtime = &swarmapi.TaskSpec_Container{Container: containerSpec}
+		} else {
+			// If the ContainerSpec is nil, we can't set the task runtime
+			return swarmapi.ServiceSpec{}, ErrMismatchedRuntime
 		}
 	case types.RuntimePlugin:
-		if s.Mode.Replicated != nil {
-			return swarmapi.ServiceSpec{}, errors.New("plugins must not use replicated mode")
-		}
-
-		s.Mode.Global = &types.GlobalService{} // must always be global
-
 		if s.TaskTemplate.PluginSpec != nil {
+			if s.Mode.Replicated != nil {
+				return swarmapi.ServiceSpec{}, errors.New("plugins must not use replicated mode")
+			}
+
+			s.Mode.Global = &types.GlobalService{} // must always be global
+
 			pluginSpec, err := proto.Marshal(s.TaskTemplate.PluginSpec)
 			if err != nil {
 				return swarmapi.ServiceSpec{}, err
@@ -198,7 +223,16 @@ func ServiceSpecToGRPC(s types.ServiceSpec) (swarmapi.ServiceSpec, error) {
 					},
 				},
 			}
+		} else {
+			return swarmapi.ServiceSpec{}, ErrMismatchedRuntime
 		}
+	case types.RuntimeNetworkAttachment:
+		// NOTE(dperny) I'm leaving this case here for completeness. The actual
+		// code is left out deliberately, as we should refuse to parse a
+		// Network Attachment runtime; it will cause weird behavior all over
+		// the system if we do. Instead, fallthrough and return
+		// ErrUnsupportedRuntime if we get one.
+		fallthrough
 	default:
 		return swarmapi.ServiceSpec{}, ErrUnsupportedRuntime
 	}
@@ -232,6 +266,7 @@ func ServiceSpecToGRPC(s types.ServiceSpec) (swarmapi.ServiceSpec, error) {
 		spec.Task.Placement = &swarmapi.Placement{
 			Constraints: s.TaskTemplate.Placement.Constraints,
 			Preferences: preferences,
+			MaxReplicas: s.TaskTemplate.Placement.MaxReplicas,
 			Platforms:   platforms,
 		}
 	}
@@ -268,13 +303,51 @@ func ServiceSpecToGRPC(s types.ServiceSpec) (swarmapi.ServiceSpec, error) {
 	}
 
 	// Mode
-	if s.Mode.Global != nil && s.Mode.Replicated != nil {
-		return swarmapi.ServiceSpec{}, fmt.Errorf("cannot specify both replicated mode and global mode")
+	numModes := 0
+	if s.Mode.Global != nil {
+		numModes++
+	}
+	if s.Mode.Replicated != nil {
+		numModes++
+	}
+	if s.Mode.ReplicatedJob != nil {
+		numModes++
+	}
+	if s.Mode.GlobalJob != nil {
+		numModes++
+	}
+
+	if numModes > 1 {
+		return swarmapi.ServiceSpec{}, fmt.Errorf("must specify only one service mode")
 	}
 
 	if s.Mode.Global != nil {
 		spec.Mode = &swarmapi.ServiceSpec_Global{
 			Global: &swarmapi.GlobalService{},
+		}
+	} else if s.Mode.GlobalJob != nil {
+		spec.Mode = &swarmapi.ServiceSpec_GlobalJob{
+			GlobalJob: &swarmapi.GlobalJob{},
+		}
+	} else if s.Mode.ReplicatedJob != nil {
+		// if the service is a replicated job, we have two different kinds of
+		// values that might need to be defaulted.
+
+		r := &swarmapi.ReplicatedJob{}
+		if s.Mode.ReplicatedJob.MaxConcurrent != nil {
+			r.MaxConcurrent = *s.Mode.ReplicatedJob.MaxConcurrent
+		} else {
+			r.MaxConcurrent = 1
+		}
+
+		if s.Mode.ReplicatedJob.TotalCompletions != nil {
+			r.TotalCompletions = *s.Mode.ReplicatedJob.TotalCompletions
+		} else {
+			r.TotalCompletions = r.MaxConcurrent
+		}
+
+		spec.Mode = &swarmapi.ServiceSpec_ReplicatedJob{
+			ReplicatedJob: r,
 		}
 	} else if s.Mode.Replicated != nil && s.Mode.Replicated.Replicas != nil {
 		spec.Mode = &swarmapi.ServiceSpec_Replicated{
@@ -327,15 +400,31 @@ func GenericResourcesFromGRPC(genericRes []*swarmapi.GenericResource) []types.Ge
 	return generic
 }
 
-func resourcesFromGRPC(res *swarmapi.ResourceRequirements) *types.ResourceRequirements {
+// resourcesFromGRPC creates a ResourceRequirements from the GRPC TaskSpec.
+// We currently require the whole TaskSpec to be passed, because PidsLimit
+// is returned as part of the container spec, instead of Resources
+// TODO move PidsLimit to Resources in the Swarm API
+func resourcesFromGRPC(ts *swarmapi.TaskSpec) *types.ResourceRequirements {
 	var resources *types.ResourceRequirements
-	if res != nil {
-		resources = &types.ResourceRequirements{}
+
+	if cs := ts.GetContainer(); cs != nil && cs.PidsLimit != 0 {
+		resources = &types.ResourceRequirements{
+			Limits: &types.Limit{
+				Pids: cs.PidsLimit,
+			},
+		}
+	}
+	if ts.Resources != nil {
+		if resources == nil {
+			resources = &types.ResourceRequirements{}
+		}
+		res := ts.Resources
 		if res.Limits != nil {
-			resources.Limits = &types.Resources{
-				NanoCPUs:    res.Limits.NanoCPUs,
-				MemoryBytes: res.Limits.MemoryBytes,
+			if resources.Limits == nil {
+				resources.Limits = &types.Limit{}
 			}
+			resources.Limits.NanoCPUs = res.Limits.NanoCPUs
+			resources.Limits.MemoryBytes = res.Limits.MemoryBytes
 		}
 		if res.Reservations != nil {
 			resources.Reservations = &types.Resources{
@@ -372,6 +461,7 @@ func resourcesToGRPC(res *types.ResourceRequirements) *swarmapi.ResourceRequirem
 	if res != nil {
 		reqs = &swarmapi.ResourceRequirements{}
 		if res.Limits != nil {
+			// TODO add PidsLimit once Swarm API has been updated to move it into Limits
 			reqs.Limits = &swarmapi.Resources{
 				NanoCPUs:    res.Limits.NanoCPUs,
 				MemoryBytes: res.Limits.MemoryBytes,
@@ -458,6 +548,7 @@ func placementFromGRPC(p *swarmapi.Placement) *types.Placement {
 	}
 	r := &types.Placement{
 		Constraints: p.Constraints,
+		MaxReplicas: p.MaxReplicas,
 	}
 
 	for _, pref := range p.Preferences {
@@ -573,6 +664,12 @@ func updateConfigToGRPC(updateConfig *types.UpdateConfig) (*swarmapi.UpdateConfi
 	return converted, nil
 }
 
+func networkAttachmentSpecFromGRPC(attachment swarmapi.NetworkAttachmentSpec) *types.NetworkAttachmentSpec {
+	return &types.NetworkAttachmentSpec{
+		ContainerID: attachment.ContainerID,
+	}
+}
+
 func taskSpecFromGRPC(taskSpec swarmapi.TaskSpec) (types.TaskSpec, error) {
 	taskNetworks := make([]types.NetworkAttachmentConfig, 0, len(taskSpec.Networks))
 	for _, n := range taskSpec.Networks {
@@ -581,7 +678,7 @@ func taskSpecFromGRPC(taskSpec swarmapi.TaskSpec) (types.TaskSpec, error) {
 	}
 
 	t := types.TaskSpec{
-		Resources:     resourcesFromGRPC(taskSpec.Resources),
+		Resources:     resourcesFromGRPC(&taskSpec),
 		RestartPolicy: restartPolicyFromGRPC(taskSpec.Restart),
 		Placement:     placementFromGRPC(taskSpec.Placement),
 		LogDriver:     driverFromGRPC(taskSpec.LogDriver),
@@ -607,6 +704,12 @@ func taskSpecFromGRPC(taskSpec swarmapi.TaskSpec) (types.TaskSpec, error) {
 				t.PluginSpec = &p
 			}
 		}
+	case *swarmapi.TaskSpec_Attachment:
+		a := taskSpec.GetAttachment()
+		if a != nil {
+			t.NetworkAttachmentSpec = networkAttachmentSpecFromGRPC(*a)
+		}
+		t.Runtime = types.RuntimeNetworkAttachment
 	}
 
 	return t, nil

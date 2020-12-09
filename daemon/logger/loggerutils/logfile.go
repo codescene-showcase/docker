@@ -1,24 +1,22 @@
 package loggerutils // import "github.com/docker/docker/daemon/logger/loggerutils"
 
 import (
-	"bytes"
 	"compress/gzip"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/docker/docker/daemon/logger"
-	"github.com/docker/docker/daemon/logger/loggerutils/multireader"
 	"github.com/docker/docker/pkg/filenotify"
 	"github.com/docker/docker/pkg/pools"
 	"github.com/docker/docker/pkg/pubsub"
-	"github.com/docker/docker/pkg/tailfile"
 	"github.com/fsnotify/fsnotify"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
@@ -70,7 +68,7 @@ func (rc *refCounter) Dereference(fileName string) error {
 	if rc.counter[fileName] <= 0 {
 		delete(rc.counter, fileName)
 		err := os.Remove(fileName)
-		if err != nil {
+		if err != nil && !os.IsNotExist(err) {
 			return err
 		}
 	}
@@ -89,22 +87,49 @@ type LogFile struct {
 	compress        bool       // whether old versions of log files are compressed
 	lastTimestamp   time.Time  // timestamp of the last log
 	filesRefCounter refCounter // keep reference-counted of decompressed files
-	notifyRotate    *pubsub.Publisher
+	notifyReaders   *pubsub.Publisher
 	marshal         logger.MarshalFunc
-	createDecoder   makeDecoderFunc
+	createDecoder   MakeDecoderFn
+	getTailReader   GetTailReaderFunc
 	perms           os.FileMode
 }
 
-type makeDecoderFunc func(rdr io.Reader) func() (*logger.Message, error)
+// MakeDecoderFn creates a decoder
+type MakeDecoderFn func(rdr io.Reader) Decoder
 
-//NewLogFile creates new LogFile
-func NewLogFile(logPath string, capacity int64, maxFiles int, compress bool, marshaller logger.MarshalFunc, decodeFunc makeDecoderFunc, perms os.FileMode) (*LogFile, error) {
-	log, err := os.OpenFile(logPath, os.O_WRONLY|os.O_APPEND|os.O_CREATE, perms)
+// Decoder is for reading logs
+// It is created by the log reader by calling the `MakeDecoderFunc`
+type Decoder interface {
+	// Reset resets the decoder
+	// Reset is called for certain events, such as log rotations
+	Reset(io.Reader)
+	// Decode decodes the next log messeage from the stream
+	Decode() (*logger.Message, error)
+	// Close signals to the decoder that it can release whatever resources it was using.
+	Close()
+}
+
+// SizeReaderAt defines a ReaderAt that also reports its size.
+// This is used for tailing log files.
+type SizeReaderAt interface {
+	io.ReaderAt
+	Size() int64
+}
+
+// GetTailReaderFunc is used to truncate a reader to only read as much as is required
+// in order to get the passed in number of log lines.
+// It returns the sectioned reader, the number of lines that the section reader
+// contains, and any error that occurs.
+type GetTailReaderFunc func(ctx context.Context, f SizeReaderAt, nLogLines int) (rdr io.Reader, nLines int, err error)
+
+// NewLogFile creates new LogFile
+func NewLogFile(logPath string, capacity int64, maxFiles int, compress bool, marshaller logger.MarshalFunc, decodeFunc MakeDecoderFn, perms os.FileMode, getTailReader GetTailReaderFunc) (*LogFile, error) {
+	log, err := openFile(logPath, os.O_WRONLY|os.O_APPEND|os.O_CREATE, perms)
 	if err != nil {
 		return nil, err
 	}
 
-	size, err := log.Seek(0, os.SEEK_END)
+	size, err := log.Seek(0, io.SeekEnd)
 	if err != nil {
 		return nil, err
 	}
@@ -116,10 +141,11 @@ func NewLogFile(logPath string, capacity int64, maxFiles int, compress bool, mar
 		maxFiles:        maxFiles,
 		compress:        compress,
 		filesRefCounter: refCounter{counter: make(map[string]int)},
-		notifyRotate:    pubsub.NewPublisher(0, 1),
+		notifyReaders:   pubsub.NewPublisher(0, 1),
 		marshal:         marshaller,
 		createDecoder:   decodeFunc,
 		perms:           perms,
+		getTailReader:   getTailReader,
 	}, nil
 }
 
@@ -141,7 +167,7 @@ func (w *LogFile) WriteLogEntry(msg *logger.Message) error {
 
 	if err := w.checkCapacityAndRotate(); err != nil {
 		w.mu.Unlock()
-		return err
+		return errors.Wrap(err, "error rotating log file")
 	}
 
 	n, err := w.f.Write(b)
@@ -149,45 +175,76 @@ func (w *LogFile) WriteLogEntry(msg *logger.Message) error {
 		w.currentSize += int64(n)
 		w.lastTimestamp = msg.Timestamp
 	}
+
 	w.mu.Unlock()
-	return err
+	return errors.Wrap(err, "error writing log entry")
 }
 
-func (w *LogFile) checkCapacityAndRotate() error {
+func (w *LogFile) checkCapacityAndRotate() (retErr error) {
 	if w.capacity == -1 {
 		return nil
 	}
+	if w.currentSize < w.capacity {
+		return nil
+	}
 
-	if w.currentSize >= w.capacity {
-		w.rotateMu.Lock()
-		fname := w.f.Name()
-		if err := w.f.Close(); err != nil {
+	w.rotateMu.Lock()
+	noCompress := w.maxFiles <= 1 || !w.compress
+	defer func() {
+		// If we aren't going to run the goroutine to compress the log file, then we need to unlock in this function.
+		// Otherwise the lock will be released in the goroutine that handles compression.
+		if retErr != nil || noCompress {
 			w.rotateMu.Unlock()
+		}
+	}()
+
+	fname := w.f.Name()
+	if err := w.f.Close(); err != nil {
+		// if there was an error during a prior rotate, the file could already be closed
+		if !errors.Is(err, os.ErrClosed) {
 			return errors.Wrap(err, "error closing file")
 		}
-		if err := rotate(fname, w.maxFiles, w.compress); err != nil {
-			w.rotateMu.Unlock()
-			return err
-		}
-		file, err := os.OpenFile(fname, os.O_WRONLY|os.O_TRUNC|os.O_CREATE, w.perms)
-		if err != nil {
-			w.rotateMu.Unlock()
-			return err
-		}
-		w.f = file
-		w.currentSize = 0
-		w.notifyRotate.Publish(struct{}{})
-
-		if w.maxFiles <= 1 || !w.compress {
-			w.rotateMu.Unlock()
-			return nil
-		}
-
-		go func() {
-			compressFile(fname+".1", w.lastTimestamp)
-			w.rotateMu.Unlock()
-		}()
 	}
+
+	if err := rotate(fname, w.maxFiles, w.compress); err != nil {
+		logrus.WithError(err).Warn("Error rotating log file, log data may have been lost")
+	} else {
+		var renameErr error
+		for i := 0; i < 10; i++ {
+			if renameErr = os.Rename(fname, fname+".1"); renameErr != nil && !os.IsNotExist(renameErr) {
+				logrus.WithError(renameErr).WithField("file", fname).Debug("Error rotating current container log file, evicting readers and retrying")
+				w.notifyReaders.Publish(renameErr)
+				time.Sleep(100 * time.Millisecond)
+				continue
+			}
+			break
+		}
+		if renameErr != nil {
+			logrus.WithError(renameErr).Error("Error renaming current log file")
+		}
+	}
+
+	file, err := openFile(fname, os.O_WRONLY|os.O_TRUNC|os.O_CREATE, w.perms)
+	if err != nil {
+		return err
+	}
+	w.f = file
+	w.currentSize = 0
+
+	w.notifyReaders.Publish(struct{}{})
+
+	if noCompress {
+		return nil
+	}
+
+	ts := w.lastTimestamp
+
+	go func() {
+		if err := compressFile(fname+".1", ts); err != nil {
+			logrus.WithError(err).Error("Error compressing log file after rotation")
+		}
+		w.rotateMu.Unlock()
+	}()
 
 	return nil
 }
@@ -201,64 +258,75 @@ func rotate(name string, maxFiles int, compress bool) error {
 	if compress {
 		extension = ".gz"
 	}
+
+	lastFile := fmt.Sprintf("%s.%d%s", name, maxFiles-1, extension)
+	err := os.Remove(lastFile)
+	if err != nil && !os.IsNotExist(err) {
+		return errors.Wrap(err, "error removing oldest log file")
+	}
+
 	for i := maxFiles - 1; i > 1; i-- {
 		toPath := name + "." + strconv.Itoa(i) + extension
 		fromPath := name + "." + strconv.Itoa(i-1) + extension
+		logrus.WithField("source", fromPath).WithField("target", toPath).Trace("Rotating log file")
 		if err := os.Rename(fromPath, toPath); err != nil && !os.IsNotExist(err) {
 			return err
 		}
 	}
 
-	if err := os.Rename(name, name+".1"); err != nil && !os.IsNotExist(err) {
-		return err
-	}
-
 	return nil
 }
 
-func compressFile(fileName string, lastTimestamp time.Time) {
-	file, err := os.Open(fileName)
+func compressFile(fileName string, lastTimestamp time.Time) (retErr error) {
+	file, err := open(fileName)
 	if err != nil {
-		logrus.Errorf("Failed to open log file: %v", err)
-		return
+		if os.IsNotExist(err) {
+			logrus.WithField("file", fileName).WithError(err).Debug("Could not open log file to compress")
+			return nil
+		}
+		return errors.Wrap(err, "failed to open log file")
 	}
 	defer func() {
 		file.Close()
-		err := os.Remove(fileName)
-		if err != nil {
-			logrus.Errorf("Failed to remove source log file: %v", err)
+		if retErr == nil {
+			err := os.Remove(fileName)
+			if err != nil && !os.IsNotExist(err) {
+				retErr = errors.Wrap(err, "failed to remove source log file")
+			}
 		}
 	}()
 
-	outFile, err := os.OpenFile(fileName+".gz", os.O_CREATE|os.O_RDWR, 0640)
+	outFile, err := openFile(fileName+".gz", os.O_CREATE|os.O_TRUNC|os.O_RDWR, 0640)
 	if err != nil {
-		logrus.Errorf("Failed to open or create gzip log file: %v", err)
-		return
+		return errors.Wrap(err, "failed to open or create gzip log file")
 	}
 	defer func() {
 		outFile.Close()
-		if err != nil {
-			os.Remove(fileName + ".gz")
+		if retErr != nil {
+			if err := os.Remove(fileName + ".gz"); err != nil && !os.IsExist(err) {
+				logrus.WithError(err).Error("Error cleaning up after failed log compression")
+			}
 		}
 	}()
 
 	compressWriter := gzip.NewWriter(outFile)
 	defer compressWriter.Close()
 
-	// Add the last log entry timestramp to the gzip header
+	// Add the last log entry timestamp to the gzip header
 	extra := rotateFileMetadata{}
 	extra.LastTime = lastTimestamp
 	compressWriter.Header.Extra, err = json.Marshal(&extra)
 	if err != nil {
 		// Here log the error only and don't return since this is just an optimization.
-		logrus.Warningf("Failed to marshal JSON: %v", err)
+		logrus.Warningf("Failed to marshal gzip header as JSON: %v", err)
 	}
 
 	_, err = pools.Copy(compressWriter, file)
 	if err != nil {
-		logrus.WithError(err).WithField("module", "container.logs").WithField("file", fileName).Error("Error compressing log file")
-		return
+		return errors.Wrapf(err, "error compressing log file %s", fileName)
 	}
+
+	return nil
 }
 
 // MaxFiles return maximum number of files
@@ -273,7 +341,7 @@ func (w *LogFile) Close() error {
 	if w.closed {
 		return nil
 	}
-	if err := w.f.Close(); err != nil {
+	if err := w.f.Close(); err != nil && !errors.Is(err, os.ErrClosed) {
 		return err
 	}
 	w.closed = true
@@ -281,15 +349,21 @@ func (w *LogFile) Close() error {
 }
 
 // ReadLogs decodes entries from log files and sends them the passed in watcher
+//
+// Note: Using the follow option can become inconsistent in cases with very frequent rotations and max log files is 1.
+// TODO: Consider a different implementation which can effectively follow logs under frequent rotations.
 func (w *LogFile) ReadLogs(config logger.ReadConfig, watcher *logger.LogWatcher) {
 	w.mu.RLock()
-	currentFile, err := os.Open(w.f.Name())
+	currentFile, err := open(w.f.Name())
 	if err != nil {
 		w.mu.RUnlock()
 		watcher.Err <- err
 		return
 	}
 	defer currentFile.Close()
+
+	dec := w.createDecoder(nil)
+	defer dec.Close()
 
 	currentChunk, err := newSectionReader(currentFile)
 	if err != nil {
@@ -298,35 +372,55 @@ func (w *LogFile) ReadLogs(config logger.ReadConfig, watcher *logger.LogWatcher)
 		return
 	}
 
+	notifyEvict := w.notifyReaders.SubscribeTopicWithBuffer(func(i interface{}) bool {
+		_, ok := i.(error)
+		return ok
+	}, 1)
+	defer w.notifyReaders.Evict(notifyEvict)
+
 	if config.Tail != 0 {
+		// TODO(@cpuguy83): Instead of opening every file, only get the files which
+		// are needed to tail.
+		// This is especially costly when compression is enabled.
 		files, err := w.openRotatedFiles(config)
+		w.mu.RUnlock()
 		if err != nil {
-			w.mu.RUnlock()
 			watcher.Err <- err
 			return
 		}
-		w.mu.RUnlock()
-		seekers := make([]io.ReadSeeker, 0, len(files)+1)
-		for _, f := range files {
-			seekers = append(seekers, f)
-		}
-		if currentChunk.Size() > 0 {
-			seekers = append(seekers, currentChunk)
-		}
-		if len(seekers) > 0 {
-			tailFile(multireader.MultiReadSeeker(seekers...), watcher, w.createDecoder, config)
-		}
-		for _, f := range files {
-			f.Close()
-			fileName := f.Name()
-			if strings.HasSuffix(fileName, tmpLogfileSuffix) {
-				err := w.filesRefCounter.Dereference(fileName)
-				if err != nil {
-					logrus.Errorf("Failed to dereference the log file %q: %v", fileName, err)
+
+		closeFiles := func() {
+			for _, f := range files {
+				f.Close()
+				fileName := f.Name()
+				if strings.HasSuffix(fileName, tmpLogfileSuffix) {
+					err := w.filesRefCounter.Dereference(fileName)
+					if err != nil {
+						logrus.WithError(err).WithField("file", fileName).Error("Failed to dereference the log file")
+					}
 				}
 			}
 		}
 
+		readers := make([]SizeReaderAt, 0, len(files)+1)
+		for _, f := range files {
+			stat, err := f.Stat()
+			if err != nil {
+				watcher.Err <- errors.Wrap(err, "error reading size of rotated file")
+				closeFiles()
+				return
+			}
+			readers = append(readers, io.NewSectionReader(f, 0, stat.Size()))
+		}
+		if currentChunk.Size() > 0 {
+			readers = append(readers, currentChunk)
+		}
+
+		ok := tailFiles(readers, watcher, dec, w.getTailReader, config, notifyEvict)
+		closeFiles()
+		if !ok {
+			return
+		}
 		w.mu.RLock()
 	}
 
@@ -336,9 +430,13 @@ func (w *LogFile) ReadLogs(config logger.ReadConfig, watcher *logger.LogWatcher)
 	}
 	w.mu.RUnlock()
 
-	notifyRotate := w.notifyRotate.Subscribe()
-	defer w.notifyRotate.Evict(notifyRotate)
-	followLogs(currentFile, watcher, notifyRotate, w.createDecoder, config.Since, config.Until)
+	notifyRotate := w.notifyReaders.SubscribeTopic(func(i interface{}) bool {
+		_, ok := i.(struct{})
+		return ok
+	})
+	defer w.notifyReaders.Evict(notifyRotate)
+
+	followLogs(currentFile, watcher, notifyRotate, notifyEvict, dec, config.Since, config.Until)
 }
 
 func (w *LogFile) openRotatedFiles(config logger.ReadConfig) (files []*os.File, err error) {
@@ -354,31 +452,31 @@ func (w *LogFile) openRotatedFiles(config logger.ReadConfig) (files []*os.File, 
 			if strings.HasSuffix(f.Name(), tmpLogfileSuffix) {
 				err := os.Remove(f.Name())
 				if err != nil && !os.IsNotExist(err) {
-					logrus.Warningf("Failed to remove the logfile %q: %v", f.Name, err)
+					logrus.Warnf("Failed to remove logfile: %v", err)
 				}
 			}
 		}
 	}()
 
 	for i := w.maxFiles; i > 1; i-- {
-		f, err := os.Open(fmt.Sprintf("%s.%d", w.f.Name(), i-1))
+		f, err := open(fmt.Sprintf("%s.%d", w.f.Name(), i-1))
 		if err != nil {
 			if !os.IsNotExist(err) {
-				return nil, err
+				return nil, errors.Wrap(err, "error opening rotated log file")
 			}
 
 			fileName := fmt.Sprintf("%s.%d.gz", w.f.Name(), i-1)
 			decompressedFileName := fileName + tmpLogfileSuffix
 			tmpFile, err := w.filesRefCounter.GetReference(decompressedFileName, func(refFileName string, exists bool) (*os.File, error) {
 				if exists {
-					return os.Open(refFileName)
+					return open(refFileName)
 				}
 				return decompressfile(fileName, refFileName, config.Since)
 			})
 
 			if err != nil {
-				if !os.IsNotExist(err) {
-					return nil, err
+				if !errors.Is(err, os.ErrNotExist) {
+					return nil, errors.Wrap(err, "error getting reference to decompressed log file")
 				}
 				continue
 			}
@@ -397,15 +495,15 @@ func (w *LogFile) openRotatedFiles(config logger.ReadConfig) (files []*os.File, 
 }
 
 func decompressfile(fileName, destFileName string, since time.Time) (*os.File, error) {
-	cf, err := os.Open(fileName)
+	cf, err := open(fileName)
 	if err != nil {
-		return nil, err
+		return nil, errors.Wrap(err, "error opening file for decompression")
 	}
 	defer cf.Close()
 
 	rc, err := gzip.NewReader(cf)
 	if err != nil {
-		return nil, err
+		return nil, errors.Wrap(err, "error making gzip reader for compressed log file")
 	}
 	defer rc.Close()
 
@@ -416,19 +514,19 @@ func decompressfile(fileName, destFileName string, since time.Time) (*os.File, e
 		return nil, nil
 	}
 
-	rs, err := os.OpenFile(destFileName, os.O_CREATE|os.O_RDWR, 0640)
+	rs, err := openFile(destFileName, os.O_CREATE|os.O_RDWR, 0640)
 	if err != nil {
-		return nil, err
+		return nil, errors.Wrap(err, "error creating file for copying decompressed log stream")
 	}
 
 	_, err = pools.Copy(rs, rc)
 	if err != nil {
 		rs.Close()
 		rErr := os.Remove(rs.Name())
-		if rErr != nil && os.IsNotExist(rErr) {
-			logrus.Errorf("Failed to remove the logfile %q: %v", rs.Name(), rErr)
+		if rErr != nil && !os.IsNotExist(rErr) {
+			logrus.Errorf("Failed to remove logfile: %v", rErr)
 		}
-		return nil, err
+		return nil, errors.Wrap(err, "error while copying decompressed log stream to file")
 	}
 
 	return rs, nil
@@ -437,31 +535,61 @@ func decompressfile(fileName, destFileName string, since time.Time) (*os.File, e
 func newSectionReader(f *os.File) (*io.SectionReader, error) {
 	// seek to the end to get the size
 	// we'll leave this at the end of the file since section reader does not advance the reader
-	size, err := f.Seek(0, os.SEEK_END)
+	size, err := f.Seek(0, io.SeekEnd)
 	if err != nil {
 		return nil, errors.Wrap(err, "error getting current file size")
 	}
 	return io.NewSectionReader(f, 0, size), nil
 }
 
-type decodeFunc func() (*logger.Message, error)
+func tailFiles(files []SizeReaderAt, watcher *logger.LogWatcher, dec Decoder, getTailReader GetTailReaderFunc, config logger.ReadConfig, notifyEvict <-chan interface{}) (cont bool) {
+	nLines := config.Tail
 
-func tailFile(f io.ReadSeeker, watcher *logger.LogWatcher, createDecoder makeDecoderFunc, config logger.ReadConfig) {
-	var rdr io.Reader = f
-	if config.Tail > 0 {
-		ls, err := tailfile.TailFile(f, config.Tail)
-		if err != nil {
-			watcher.Err <- err
-			return
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cont = true
+	// TODO(@cpuguy83): we should plumb a context through instead of dealing with `WatchClose()` here.
+	go func() {
+		select {
+		case err := <-notifyEvict:
+			if err != nil {
+				watcher.Err <- err.(error)
+				cont = false
+				cancel()
+			}
+		case <-ctx.Done():
+		case <-watcher.WatchConsumerGone():
+			cont = false
+			cancel()
 		}
-		rdr = bytes.NewBuffer(bytes.Join(ls, []byte("\n")))
+	}()
+
+	readers := make([]io.Reader, 0, len(files))
+
+	if config.Tail > 0 {
+		for i := len(files) - 1; i >= 0 && nLines > 0; i-- {
+			tail, n, err := getTailReader(ctx, files[i], nLines)
+			if err != nil {
+				watcher.Err <- errors.Wrap(err, "error finding file position to start log tailing")
+				return
+			}
+			nLines -= n
+			readers = append([]io.Reader{tail}, readers...)
+		}
+	} else {
+		for _, r := range files {
+			readers = append(readers, &wrappedReaderAt{ReaderAt: r})
+		}
 	}
 
-	decodeLogLine := createDecoder(rdr)
+	rdr := io.MultiReader(readers...)
+	dec.Reset(rdr)
+
 	for {
-		msg, err := decodeLogLine()
+		msg, err := dec.Decode()
 		if err != nil {
-			if err != io.EOF {
+			if !errors.Is(err, io.EOF) {
 				watcher.Err <- err
 			}
 			return
@@ -473,15 +601,15 @@ func tailFile(f io.ReadSeeker, watcher *logger.LogWatcher, createDecoder makeDec
 			return
 		}
 		select {
-		case <-watcher.WatchClose():
+		case <-ctx.Done():
 			return
 		case watcher.Msg <- msg:
 		}
 	}
 }
 
-func followLogs(f *os.File, logWatcher *logger.LogWatcher, notifyRotate chan interface{}, createDecoder makeDecoderFunc, since, until time.Time) {
-	decodeLogLine := createDecoder(f)
+func followLogs(f *os.File, logWatcher *logger.LogWatcher, notifyRotate, notifyEvict chan interface{}, dec Decoder, since, until time.Time) {
+	dec.Reset(f)
 
 	name := f.Name()
 	fileWatcher, err := watchFile(name)
@@ -491,20 +619,8 @@ func followLogs(f *os.File, logWatcher *logger.LogWatcher, notifyRotate chan int
 	}
 	defer func() {
 		f.Close()
-		fileWatcher.Remove(name)
+		dec.Close()
 		fileWatcher.Close()
-	}()
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go func() {
-		select {
-		case <-logWatcher.WatchClose():
-			fileWatcher.Remove(name)
-			cancel()
-		case <-ctx.Done():
-			return
-		}
 	}()
 
 	var retries int
@@ -514,7 +630,7 @@ func followLogs(f *os.File, logWatcher *logger.LogWatcher, notifyRotate chan int
 
 		// retry when the file doesn't exist
 		for retries := 0; retries <= 5; retries++ {
-			f, err = os.Open(name)
+			f, err = open(name)
 			if err == nil || !os.IsNotExist(err) {
 				break
 			}
@@ -525,23 +641,39 @@ func followLogs(f *os.File, logWatcher *logger.LogWatcher, notifyRotate chan int
 		if err := fileWatcher.Add(name); err != nil {
 			return err
 		}
-		decodeLogLine = createDecoder(f)
+		dec.Reset(f)
 		return nil
 	}
 
 	errRetry := errors.New("retry")
 	errDone := errors.New("done")
+
+	handleMustClose := func(evictErr error) {
+		f.Close()
+		dec.Close()
+		logWatcher.Err <- errors.Wrap(err, "log reader evicted due to errors")
+		logrus.WithField("file", f.Name()).Error("Log reader notified that it must re-open log file, some log data may not be streamed to the client.")
+	}
+
 	waitRead := func() error {
 		select {
+		case e := <-notifyEvict:
+			if e != nil {
+				err := e.(error)
+				handleMustClose(err)
+			}
+			return errDone
 		case e := <-fileWatcher.Events():
 			switch e.Op {
 			case fsnotify.Write:
-				decodeLogLine = createDecoder(f)
+				dec.Reset(f)
 				return nil
 			case fsnotify.Rename, fsnotify.Remove:
 				select {
 				case <-notifyRotate:
-				case <-ctx.Done():
+				case <-logWatcher.WatchProducerGone():
+					return errDone
+				case <-logWatcher.WatchConsumerGone():
 					return errDone
 				}
 				if err := handleRotate(); err != nil {
@@ -551,7 +683,7 @@ func followLogs(f *os.File, logWatcher *logger.LogWatcher, notifyRotate chan int
 			}
 			return errRetry
 		case err := <-fileWatcher.Errors():
-			logrus.Debug("logger got error watching file: %v", err)
+			logrus.Debugf("logger got error watching file: %v", err)
 			// Something happened, let's try and stay alive and create a new watcher
 			if retries <= 5 {
 				fileWatcher.Close()
@@ -563,14 +695,30 @@ func followLogs(f *os.File, logWatcher *logger.LogWatcher, notifyRotate chan int
 				return errRetry
 			}
 			return err
-		case <-ctx.Done():
+		case <-logWatcher.WatchProducerGone():
+			return errDone
+		case <-logWatcher.WatchConsumerGone():
 			return errDone
 		}
 	}
 
+	oldSize := int64(-1)
 	handleDecodeErr := func(err error) error {
-		if err != io.EOF {
+		if !errors.Is(err, io.EOF) {
 			return err
+		}
+
+		// Handle special case (#39235): max-file=1 and file was truncated
+		st, stErr := f.Stat()
+		if stErr == nil {
+			size := st.Size()
+			defer func() { oldSize = size }()
+			if size < oldSize { // truncated
+				f.Seek(0, 0)
+				return nil
+			}
+		} else {
+			logrus.WithError(stErr).Warn("logger: stat error")
 		}
 
 		for {
@@ -588,7 +736,15 @@ func followLogs(f *os.File, logWatcher *logger.LogWatcher, notifyRotate chan int
 
 	// main loop
 	for {
-		msg, err := decodeLogLine()
+		select {
+		case err := <-notifyEvict:
+			if err != nil {
+				handleMustClose(err.(error))
+			}
+			return
+		default:
+		}
+		msg, err := dec.Decode()
 		if err != nil {
 			if err := handleDecodeErr(err); err != nil {
 				if err == errDone {
@@ -609,39 +765,46 @@ func followLogs(f *os.File, logWatcher *logger.LogWatcher, notifyRotate chan int
 		if !until.IsZero() && msg.Timestamp.After(until) {
 			return
 		}
+		// send the message, unless the consumer is gone
 		select {
-		case logWatcher.Msg <- msg:
-		case <-ctx.Done():
-			logWatcher.Msg <- msg
-			for {
-				msg, err := decodeLogLine()
-				if err != nil {
-					return
-				}
-				if !since.IsZero() && msg.Timestamp.Before(since) {
-					continue
-				}
-				if !until.IsZero() && msg.Timestamp.After(until) {
-					return
-				}
-				logWatcher.Msg <- msg
+		case e := <-notifyEvict:
+			if e != nil {
+				err := e.(error)
+				logrus.WithError(err).Debug("Reader evicted while sending log message")
+				logWatcher.Err <- err
 			}
+			return
+		case logWatcher.Msg <- msg:
+		case <-logWatcher.WatchConsumerGone():
+			return
 		}
 	}
 }
 
 func watchFile(name string) (filenotify.FileWatcher, error) {
-	fileWatcher, err := filenotify.New()
-	if err != nil {
-		return nil, err
+	var fileWatcher filenotify.FileWatcher
+
+	if runtime.GOOS == "windows" {
+		// FileWatcher on Windows files is based on the syscall notifications which has an issue because of file caching.
+		// It is based on ReadDirectoryChangesW() which doesn't detect writes to the cache. It detects writes to disk only.
+		// Because of the OS lazy writing, we don't get notifications for file writes and thereby the watcher
+		// doesn't work. Hence for Windows we will use poll based notifier.
+		fileWatcher = filenotify.NewPollingWatcher()
+	} else {
+		var err error
+		fileWatcher, err = filenotify.New()
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	logger := logrus.WithFields(logrus.Fields{
 		"module": "logger",
-		"fille":  name,
+		"file":   name,
 	})
 
 	if err := fileWatcher.Add(name); err != nil {
+		// we will retry using file poller.
 		logger.WithError(err).Warnf("falling back to file poller")
 		fileWatcher.Close()
 		fileWatcher = filenotify.NewPollingWatcher()
@@ -652,5 +815,17 @@ func watchFile(name string) (filenotify.FileWatcher, error) {
 			return nil, err
 		}
 	}
+
 	return fileWatcher, nil
+}
+
+type wrappedReaderAt struct {
+	io.ReaderAt
+	pos int64
+}
+
+func (r *wrappedReaderAt) Read(p []byte) (int, error) {
+	n, err := r.ReaderAt.ReadAt(p, r.pos)
+	r.pos += int64(n)
+	return n, err
 }

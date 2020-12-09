@@ -1,6 +1,7 @@
 package daemon // import "github.com/docker/docker/daemon"
 
 import (
+	"context"
 	"fmt"
 	"runtime"
 
@@ -8,6 +9,7 @@ import (
 	"github.com/docker/docker/container"
 	"github.com/docker/docker/pkg/stringid"
 	volumemounts "github.com/docker/docker/volume/mounts"
+	volumeopts "github.com/docker/docker/volume/service/opts"
 )
 
 // createContainerOSSpecificSettings performs host-OS specific container create functionality
@@ -36,7 +38,7 @@ func (daemon *Daemon) createContainerOSSpecificSettings(container *container.Con
 
 		// If the mountpoint doesn't have a name, generate one.
 		if len(mp.Name) == 0 {
-			mp.Name = stringid.GenerateNonCryptoID()
+			mp.Name = stringid.GenerateRandomID()
 		}
 
 		// Skip volumes for which we already have something mounted on that
@@ -49,7 +51,7 @@ func (daemon *Daemon) createContainerOSSpecificSettings(container *container.Con
 
 		// Create the volume in the volume driver. If it doesn't exist,
 		// a new one will be created.
-		v, err := daemon.volumes.CreateWithRef(mp.Name, volumeDriver, container.ID, nil, nil)
+		v, err := daemon.volumes.Create(context.TODO(), mp.Name, volumeDriver, volumeopts.WithCreateReference(container.ID))
 		if err != nil {
 			return err
 		}
@@ -85,7 +87,7 @@ func (daemon *Daemon) createContainerOSSpecificSettings(container *container.Con
 		//	}
 
 		// Add it to container.MountPoints
-		container.AddMountPointWithVolume(mp.Destination, v, mp.RW)
+		container.AddMountPointWithVolume(mp.Destination, &volumeWrapper{v: v, s: daemon.volumes}, mp.RW)
 	}
 	return nil
 }

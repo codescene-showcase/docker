@@ -8,25 +8,26 @@ import (
 
 	"github.com/containerd/continuity/sysx"
 	"github.com/pkg/errors"
+	"github.com/tonistiigi/fsutil/types"
 )
 
-func rewriteMetadata(p string, stat *Stat) error {
+func rewriteMetadata(p string, stat *types.Stat) error {
 	for key, value := range stat.Xattrs {
 		sysx.Setxattr(p, key, value, 0)
 	}
 
 	if err := os.Lchown(p, int(stat.Uid), int(stat.Gid)); err != nil {
-		return errors.Wrapf(err, "failed to lchown %s", p)
+		return errors.WithStack(err)
 	}
 
 	if os.FileMode(stat.Mode)&os.ModeSymlink == 0 {
 		if err := os.Chmod(p, os.FileMode(stat.Mode)); err != nil {
-			return errors.Wrapf(err, "failed to chown %s", p)
+			return errors.WithStack(err)
 		}
 	}
 
 	if err := chtimes(p, stat.ModTime); err != nil {
-		return errors.Wrapf(err, "failed to chtimes %s", p)
+		return err
 	}
 
 	return nil
@@ -34,7 +35,7 @@ func rewriteMetadata(p string, stat *Stat) error {
 
 // handleTarTypeBlockCharFifo is an OS-specific helper function used by
 // createTarFile to handle the following types of header: Block; Char; Fifo
-func handleTarTypeBlockCharFifo(path string, stat *Stat) error {
+func handleTarTypeBlockCharFifo(path string, stat *types.Stat) error {
 	mode := uint32(stat.Mode & 07777)
 	if os.FileMode(stat.Mode)&os.ModeCharDevice != 0 {
 		mode |= syscall.S_IFCHR
@@ -45,7 +46,7 @@ func handleTarTypeBlockCharFifo(path string, stat *Stat) error {
 	}
 
 	if err := syscall.Mknod(path, mode, int(mkdev(stat.Devmajor, stat.Devminor))); err != nil {
-		return err
+		return errors.WithStack(err)
 	}
 	return nil
 }

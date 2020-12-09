@@ -8,18 +8,20 @@ import (
 	"io/ioutil"
 	"math/rand"
 	"strings"
+	"testing"
 
 	winio "github.com/Microsoft/go-winio"
+	"github.com/Microsoft/hcsshim/osversion"
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/mount"
-	"github.com/go-check/check"
-	"github.com/gotestyourself/gotestyourself/assert"
-	is "github.com/gotestyourself/gotestyourself/assert/cmp"
+	"github.com/pkg/errors"
+	"gotest.tools/v3/assert"
+	is "gotest.tools/v3/assert/cmp"
 )
 
-func (s *DockerSuite) TestContainersAPICreateMountsBindNamedPipe(c *check.C) {
-	testRequires(c, SameHostDaemon, DaemonIsWindowsAtLeastBuild(16299)) // Named pipe support was added in RS3
+func (s *DockerSuite) TestContainersAPICreateMountsBindNamedPipe(c *testing.T) {
+	testRequires(c, testEnv.IsLocalDaemon, DaemonIsWindowsAtLeastBuild(osversion.RS3)) // Named pipe support was added in RS3
 
 	// Create a host pipe to map into the container
 	hostPipeName := fmt.Sprintf(`\\.\pipe\docker-cli-test-pipe-%x`, rand.Uint64())
@@ -64,7 +66,7 @@ func (s *DockerSuite) TestContainersAPICreateMountsBindNamedPipe(c *check.C) {
 				},
 			},
 		},
-		nil, name)
+		nil, nil, name)
 	assert.NilError(c, err)
 
 	err = client.ContainerStart(ctx, name, types.ContainerStartOptions{})
@@ -73,4 +75,9 @@ func (s *DockerSuite) TestContainersAPICreateMountsBindNamedPipe(c *check.C) {
 	err = <-ch
 	assert.NilError(c, err)
 	assert.Check(c, is.Equal(text, strings.TrimSpace(string(b))))
+}
+
+func mountWrapper(device, target, mType, options string) error {
+	// This should never be called.
+	return errors.Errorf("there is no implementation of Mount on this platform")
 }

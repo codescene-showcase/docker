@@ -5,16 +5,15 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/docker/docker/internal/test/request"
-	"github.com/docker/docker/internal/testutil"
-	"github.com/gotestyourself/gotestyourself/assert"
-	is "github.com/gotestyourself/gotestyourself/assert/cmp"
+	"github.com/docker/docker/testutil"
+	"gotest.tools/v3/assert"
+	is "gotest.tools/v3/assert/cmp"
 )
 
 // tagging a named image in a new unprefixed repo should work
 func TestTagUnprefixedRepoByNameOrName(t *testing.T) {
 	defer setupTest(t)()
-	client := request.NewAPIClient(t)
+	client := testEnv.APIClient()
 	ctx := context.Background()
 
 	// By name
@@ -32,14 +31,14 @@ func TestTagUnprefixedRepoByNameOrName(t *testing.T) {
 // TODO (yongtang): Migrate to unit tests
 func TestTagInvalidReference(t *testing.T) {
 	defer setupTest(t)()
-	client := request.NewAPIClient(t)
+	client := testEnv.APIClient()
 	ctx := context.Background()
 
 	invalidRepos := []string{"fo$z$", "Foo@3cc", "Foo$3", "Foo*3", "Fo^3", "Foo!3", "F)xcz(", "fo%asd", "FOO/bar"}
 
 	for _, repo := range invalidRepos {
 		err := client.ImageTag(ctx, "busybox", repo)
-		testutil.ErrorContains(t, err, "not a valid repository/tag")
+		assert.Check(t, is.ErrorContains(err, "not a valid repository/tag"))
 	}
 
 	longTag := testutil.GenerateRandomAlphaOnlyString(121)
@@ -48,30 +47,30 @@ func TestTagInvalidReference(t *testing.T) {
 
 	for _, repotag := range invalidTags {
 		err := client.ImageTag(ctx, "busybox", repotag)
-		testutil.ErrorContains(t, err, "not a valid repository/tag")
+		assert.Check(t, is.ErrorContains(err, "not a valid repository/tag"))
 	}
 
 	// test repository name begin with '-'
 	err := client.ImageTag(ctx, "busybox:latest", "-busybox:test")
-	testutil.ErrorContains(t, err, "Error parsing reference")
+	assert.Check(t, is.ErrorContains(err, "Error parsing reference"))
 
 	// test namespace name begin with '-'
 	err = client.ImageTag(ctx, "busybox:latest", "-test/busybox:test")
-	testutil.ErrorContains(t, err, "Error parsing reference")
+	assert.Check(t, is.ErrorContains(err, "Error parsing reference"))
 
 	// test index name begin with '-'
 	err = client.ImageTag(ctx, "busybox:latest", "-index:5000/busybox:test")
-	testutil.ErrorContains(t, err, "Error parsing reference")
+	assert.Check(t, is.ErrorContains(err, "Error parsing reference"))
 
 	// test setting tag fails
 	err = client.ImageTag(ctx, "busybox:latest", "sha256:sometag")
-	testutil.ErrorContains(t, err, "refusing to create an ambiguous tag using digest algorithm as name")
+	assert.Check(t, is.ErrorContains(err, "refusing to create an ambiguous tag using digest algorithm as name"))
 }
 
 // ensure we allow the use of valid tags
 func TestTagValidPrefixedRepo(t *testing.T) {
 	defer setupTest(t)()
-	client := request.NewAPIClient(t)
+	client := testEnv.APIClient()
 	ctx := context.Background()
 
 	validRepos := []string{"fooo/bar", "fooaa/test", "foooo:t", "HOSTNAME.DOMAIN.COM:443/foo/bar"}
@@ -85,7 +84,7 @@ func TestTagValidPrefixedRepo(t *testing.T) {
 // tag an image with an existed tag name without -f option should work
 func TestTagExistedNameWithoutForce(t *testing.T) {
 	defer setupTest(t)()
-	client := request.NewAPIClient(t)
+	client := testEnv.APIClient()
 	ctx := context.Background()
 
 	err := client.ImageTag(ctx, "busybox:latest", "busybox:test")
@@ -96,7 +95,7 @@ func TestTagExistedNameWithoutForce(t *testing.T) {
 // ensure all tags result in the same name
 func TestTagOfficialNames(t *testing.T) {
 	defer setupTest(t)()
-	client := request.NewAPIClient(t)
+	client := testEnv.APIClient()
 	ctx := context.Background()
 
 	names := []string{
@@ -126,14 +125,15 @@ func TestTagOfficialNames(t *testing.T) {
 // ensure tags can not match digests
 func TestTagMatchesDigest(t *testing.T) {
 	defer setupTest(t)()
-	client := request.NewAPIClient(t)
+	client := testEnv.APIClient()
 	ctx := context.Background()
 
 	digest := "busybox@sha256:abcdef76720241213f5303bda7704ec4c2ef75613173910a56fb1b6e20251507"
 	// test setting tag fails
 	err := client.ImageTag(ctx, "busybox:latest", digest)
-	testutil.ErrorContains(t, err, "refusing to create a tag with a digest reference")
+	assert.Check(t, is.ErrorContains(err, "refusing to create a tag with a digest reference"))
+
 	// check that no new image matches the digest
 	_, _, err = client.ImageInspectWithRaw(ctx, digest)
-	testutil.ErrorContains(t, err, fmt.Sprintf("No such image: %s", digest))
+	assert.Check(t, is.ErrorContains(err, fmt.Sprintf("No such image: %s", digest)))
 }

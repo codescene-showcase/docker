@@ -60,6 +60,9 @@
 .PARAMETER TestUnit
      Runs unit tests.
 
+.PARAMETER TestIntegration
+     Runs integration tests.
+
 .PARAMETER All
      Runs everything this script knows about that can run in a container.
 
@@ -84,12 +87,14 @@ param(
     [Parameter(Mandatory=$False)][switch]$PkgImports,
     [Parameter(Mandatory=$False)][switch]$GoFormat,
     [Parameter(Mandatory=$False)][switch]$TestUnit,
+    [Parameter(Mandatory=$False)][switch]$TestIntegration,
     [Parameter(Mandatory=$False)][switch]$All
 )
 
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
 $pushed=$False  # To restore the directory if we have temporarily pushed to one.
+Set-Variable GOTESTSUM_LOCATION -option Constant -value "$env:GOPATH/bin/"
 
 # Utility function to get the commit ID of the repository
 Function Get-GitCommit() {
@@ -130,7 +135,7 @@ Function Check-InContainer() {
 # outside of a container where it may be out of date with master.
 Function Verify-GoVersion() {
     Try {
-        $goVersionDockerfile=(Get-Content ".\Dockerfile" | Select-String "ENV GO_VERSION").ToString().Split(" ")[2]
+        $goVersionDockerfile=(Select-String -Path ".\Dockerfile" -Pattern "^ARG[\s]+GO_VERSION=(.*)$").Matches.groups[1].Value -replace '\.0$',''
         $goVersionInstalled=(go version).ToString().Split(" ")[2].SubString(2)
     }
     Catch [Exception] {
@@ -218,7 +223,7 @@ Function Validate-DCO($headCommit, $upstreamCommit) {
     if ($LASTEXITCODE -ne 0) { Throw "Failed git log --format" }
     $commits = $($commits -split '\s+' -match '\S')
     $badCommits=@()
-    $commits | %{
+    $commits | ForEach-Object{
         # Skip commits with no content such as merge commits etc
         if ($(git log -1 --format=format: --name-status $_).Length -gt 0) {
             # Ignore exit code on next call - always process regardless
@@ -244,7 +249,7 @@ Function Validate-PkgImports($headCommit, $upstreamCommit) {
 
     # Get a list of go source-code files which have changed under pkg\. Ignore exit code on next call - always process regardless
     $files=@(); $files = Invoke-Expression "git diff $upstreamCommit...$headCommit --diff-filter=ACMR --name-only -- `'pkg\*.go`'"
-    $badFiles=@(); $files | %{
+    $badFiles=@(); $files | ForEach-Object{
         $file=$_
         # For the current changed file, get its list of dependencies, sorted and uniqued.
         $imports = Invoke-Expression "go list -e -f `'{{ .Deps }}`' $file"
@@ -255,13 +260,13 @@ Function Validate-PkgImports($headCommit, $upstreamCommit) {
                                   -NotMatch "^github.com/docker/docker/vendor" `
                                   -Match "^github.com/docker/docker" `
                                   -Replace "`n", ""
-        $imports | % { $badFiles+="$file imports $_`n" }
+        $imports | ForEach-Object{ $badFiles+="$file imports $_`n" }
     }
     if ($badFiles.Length -eq 0) {
         Write-Host 'Congratulations!  ".\pkg\*.go" is safely isolated from internal code.'
     } else {
         $e = "`nThese files import internal code: (either directly or indirectly)`n"
-        $badFiles | %{ $e+=" - $_"}
+        $badFiles | ForEach-Object{ $e+=" - $_"}
         Throw $e
     }
 }
@@ -297,7 +302,7 @@ Function Validate-GoFormat($headCommit, $upstreamCommit) {
         Write-Host 'Congratulations!  All Go source files are properly formatted.'
     } else {
         $e = "`nThese files are not properly gofmt`'d:`n"
-        $badFiles | %{ $e+=" - $_`n"}
+        $badFiles | ForEach-Object{ $e+=" - $_`n"}
         $e+= "`nPlease reformat the above files using `"gofmt -s -w`" and commit the result."
         Throw $e
     }
@@ -315,9 +320,56 @@ Function Run-UnitTests() {
     $pkgList = $pkgList | Select-String -NotMatch "github.com/docker/docker/man"
     $pkgList = $pkgList | Select-String -NotMatch "github.com/docker/docker/integration"
     $pkgList = $pkgList -replace "`r`n", " "
-    $goTestCommand = "go test" + $raceParm + " -cover -ldflags -w -tags """ + "autogen daemon" + """ -a """ + "-test.timeout=10m" + """ $pkgList"
-    Invoke-Expression $goTestCommand
-    if ($LASTEXITCODE -ne 0) { Throw "Unit tests failed" }
+
+    $goTestArg = "--format=standard-verbose --jsonfile=bundles\go-test-report-unit-tests.json --junitfile=bundles\junit-report-unit-tests.xml -- " + $raceParm + " -cover -ldflags -w -a """ + "-test.timeout=10m" + """ $pkgList"
+    Write-Host "INFO: Invoking unit tests run with $GOTESTSUM_LOCATION\gotestsum.exe $goTestArg"
+    $pinfo = New-Object System.Diagnostics.ProcessStartInfo
+    $pinfo.FileName = "$GOTESTSUM_LOCATION\gotestsum.exe"
+    $pinfo.WorkingDirectory = "$($PWD.Path)"
+    $pinfo.UseShellExecute = $false
+    $pinfo.Arguments = $goTestArg
+    $p = New-Object System.Diagnostics.Process
+    $p.StartInfo = $pinfo
+    $p.Start() | Out-Null
+    $p.WaitForExit()
+    if ($p.ExitCode -ne 0) { Throw "Unit tests failed" }
+}
+
+# Run the integration tests
+Function Run-IntegrationTests() {
+    $escRoot = [Regex]::Escape($root)
+    $env:DOCKER_INTEGRATION_DAEMON_DEST = $bundlesDir + "\tmp"
+    $dirs = go list -test -f '{{- if ne .ForTest `"`" -}}{{- .Dir -}}{{- end -}}' .\integration\...
+    ForEach($dir in $dirs) {
+        # Normalize directory name for using in the test results files.
+        $normDir = $dir.Trim()
+        $normDir = $normDir -replace $escRoot, ""
+        $normDir = $normDir -replace "\\", "-"
+        $normDir = $normDir -replace "\/", "-"
+        $normDir = $normDir -replace "\.", "-"
+        if ($normDir.StartsWith("-"))
+        {
+            $normDir = $normDir.TrimStart("-")
+        }
+        if ($normDir.EndsWith("-"))
+        {
+            $normDir = $normDir.TrimEnd("-")
+        }
+        $jsonFilePath = $bundlesDir + "\go-test-report-int-tests-$normDir" + ".json"
+        $xmlFilePath = $bundlesDir + "\junit-report-int-tests-$normDir" + ".xml"
+        Set-Location $dir
+        Write-Host "Running $($PWD.Path)"
+        $pinfo = New-Object System.Diagnostics.ProcessStartInfo
+        $pinfo.FileName = "gotestsum.exe"
+        $pinfo.WorkingDirectory = "$($PWD.Path)"
+        $pinfo.UseShellExecute = $false
+        $pinfo.Arguments = "--format=standard-verbose --jsonfile=$jsonFilePath --junitfile=$xmlFilePath -- $env:INTEGRATION_TESTFLAGS"
+        $p = New-Object System.Diagnostics.Process
+        $p.StartInfo = $pinfo
+        $p.Start() | Out-Null
+        $p.WaitForExit()
+        if ($p.ExitCode -ne 0) { Throw "Integration tests failed" }
+    }
 }
 
 # Start of main code.
@@ -328,16 +380,21 @@ Try {
     $root = $(Split-Path $MyInvocation.MyCommand.Definition -Parent | Split-Path -Parent)
     Push-Location $root
 
+    # Ensure the bundles directory exists
+    $bundlesDir = $root + "\bundles"
+    Set-Variable bundlesDir -option ReadOnly
+    New-Item -Force $bundlesDir -ItemType Directory | Out-Null
+
     # Handle the "-All" shortcut to turn on all things we can handle.
     # Note we expressly only include the items which can run in a container - the validations tests cannot
     # as they require the .git directory which is excluded from the image by .dockerignore
-    if ($All) { $Client=$True; $Daemon=$True; $TestUnit=$True }
+    if ($All) { $Client=$True; $Daemon=$True; $TestUnit=$True; }
 
     # Handle the "-Binary" shortcut to build both client and daemon.
     if ($Binary) { $Client = $True; $Daemon = $True }
 
     # Default to building the daemon if not asked for anything explicitly.
-    if (-not($Client) -and -not($Daemon) -and -not($DCO) -and -not($PkgImports) -and -not($GoFormat) -and -not($TestUnit)) { $Daemon=$True }
+    if (-not($Client) -and -not($Daemon) -and -not($DCO) -and -not($PkgImports) -and -not($GoFormat) -and -not($TestUnit) -and -not($TestIntegration)) { $Daemon=$True }
 
     # Verify git is installed
     if ($(Get-Command git -ErrorAction SilentlyContinue) -eq $nil) { Throw "Git does not appear to be installed" }
@@ -351,6 +408,8 @@ Try {
 
     # Get the version of docker (eg 17.04.0-dev)
     $dockerVersion="0.0.0-dev"
+    # Overwrite dockerVersion if VERSION Environment variable is available
+    if (Test-Path Env:\VERSION) { $dockerVersion=$env:VERSION }
 
     # Give a warning if we are not running in a container and are building binaries or running unit tests.
     # Not relevant for validation tests as these are fine to run outside of a container.
@@ -365,7 +424,7 @@ Try {
     # Run autogen if building binaries or running unit tests.
     if ($Client -or $Daemon -or $TestUnit) {
         Write-Host "INFO: Invoking autogen..."
-        Try { .\hack\make\.go-autogen.ps1 -CommitString $gitCommit -DockerVersion $dockerVersion -Platform "$env:PLATFORM" }
+        Try { .\hack\make\.go-autogen.ps1 -CommitString $gitCommit -DockerVersion $dockerVersion -Platform "$env:PLATFORM" -Product "$env:PRODUCT" }
         Catch [Exception] { Throw $_ }
     }
 
@@ -387,15 +446,13 @@ Try {
 
     # Build the binaries
     if ($Client -or $Daemon) {
-        # Create the bundles directory if it doesn't exist
-        if (-not (Test-Path ".\bundles")) { New-Item ".\bundles" -ItemType Directory | Out-Null }
 
         # Perform the actual build
         if ($Daemon) { Execute-Build "daemon" "daemon" "dockerd" }
         if ($Client) {
             # Get the Docker channel and version from the environment, or use the defaults.
-            if (-not ($channel = $env:DOCKERCLI_CHANNEL)) { $channel = "edge" }
-            if (-not ($version = $env:DOCKERCLI_VERSION)) { $version = "17.06.0-ce" }
+            if (-not ($channel = $env:DOCKERCLI_CHANNEL)) { $channel = "stable" }
+            if (-not ($version = $env:DOCKERCLI_VERSION)) { $version = "17.06.2-ce" }
 
             # Download the zip file and extract the client executable.
             Write-Host "INFO: Downloading docker/cli version $version from $channel..."
@@ -423,6 +480,9 @@ Try {
     # Run unit tests
     if ($TestUnit) { Run-UnitTests }
 
+    # Run integration tests
+    if ($TestIntegration) { Run-IntegrationTests }
+
     # Gratuitous ASCII art.
     if ($Daemon -or $Client) {
         Write-Host
@@ -437,6 +497,7 @@ Try {
 }
 Catch [Exception] {
     Write-Host -ForegroundColor Red ("`nERROR: make.ps1 failed:`n$_")
+    Write-Host -ForegroundColor Red ($_.InvocationInfo.PositionMessage)
 
     # More gratuitous ASCII art.
     Write-Host
@@ -448,7 +509,7 @@ Catch [Exception] {
     Write-Host -ForegroundColor Red  "     \/        \/             \/     \/ "
     Write-Host
 
-    Throw $_
+    exit 1
 }
 Finally {
     Pop-Location # As we pushed to the root of the repo as the very first thing

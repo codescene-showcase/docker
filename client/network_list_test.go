@@ -12,6 +12,7 @@ import (
 
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/filters"
+	"github.com/docker/docker/errdefs"
 )
 
 func TestNetworkListError(t *testing.T) {
@@ -22,8 +23,8 @@ func TestNetworkListError(t *testing.T) {
 	_, err := client.NetworkList(context.Background(), types.NetworkListOptions{
 		Filters: filters.NewArgs(),
 	})
-	if err == nil || err.Error() != "Error response from daemon: Server error" {
-		t.Fatalf("expected a Server Error, got %v", err)
+	if !errdefs.IsSystem(err) {
+		t.Fatalf("expected a Server Error, got %[1]T: %[1]v", err)
 	}
 }
 
@@ -73,7 +74,7 @@ func TestNetworkList(t *testing.T) {
 				if !strings.HasPrefix(req.URL.Path, expectedURL) {
 					return nil, fmt.Errorf("Expected URL '%s', got '%s'", expectedURL, req.URL)
 				}
-				if req.Method != "GET" {
+				if req.Method != http.MethodGet {
 					return nil, fmt.Errorf("expected GET method, got %s", req.Method)
 				}
 				query := req.URL.Query()

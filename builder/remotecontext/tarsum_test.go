@@ -9,8 +9,8 @@ import (
 	"github.com/docker/docker/builder"
 	"github.com/docker/docker/pkg/archive"
 	"github.com/docker/docker/pkg/reexec"
-	"github.com/gotestyourself/gotestyourself/skip"
 	"github.com/pkg/errors"
+	"gotest.tools/v3/skip"
 )
 
 const (
@@ -38,7 +38,7 @@ func TestCloseRootDirectory(t *testing.T) {
 
 	_, err = os.Stat(src.Root().Path())
 
-	if !os.IsNotExist(err) {
+	if !errors.Is(err, os.ErrNotExist) {
 		t.Fatal("Directory should not exist at this point")
 	}
 }
@@ -131,13 +131,13 @@ func TestRemoveDirectory(t *testing.T) {
 	}
 
 	_, err = src.Root().Stat(src.Root().Join(src.Root().Path(), relativePath))
-	if !os.IsNotExist(errors.Cause(err)) {
+	if !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("Directory should not exist at this point: %+v ", err)
 	}
 }
 
 func makeTestArchiveContext(t *testing.T, dir string) builder.Source {
-	skip.IfCondition(t, os.Getuid() != 0, "skipping test that requires root")
+	skip.If(t, os.Getuid() != 0, "skipping test that requires root")
 	tarStream, err := archive.Tar(dir, archive.Uncompressed)
 	if err != nil {
 		t.Fatalf("error: %s", err)

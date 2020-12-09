@@ -1,12 +1,12 @@
 package scheduler
 
 import (
+	"context"
 	"time"
 
 	"github.com/docker/swarmkit/api"
 	"github.com/docker/swarmkit/api/genericresource"
 	"github.com/docker/swarmkit/log"
-	"golang.org/x/net/context"
 )
 
 // hostPortSpec specifies a used host port.
@@ -45,8 +45,8 @@ type NodeInfo struct {
 
 func newNodeInfo(n *api.Node, tasks map[string]*api.Task, availableResources api.Resources) NodeInfo {
 	nodeInfo := NodeInfo{
-		Node:  n,
-		Tasks: make(map[string]*api.Task),
+		Node:                      n,
+		Tasks:                     make(map[string]*api.Task),
 		ActiveTasksCountByService: make(map[string]int),
 		AvailableResources:        availableResources.Copy(),
 		usedHostPorts:             make(map[hostPortSpec]struct{}),
@@ -70,7 +70,7 @@ func (nodeInfo *NodeInfo) removeTask(t *api.Task) bool {
 	}
 
 	delete(nodeInfo.Tasks, t.ID)
-	if oldTask.DesiredState <= api.TaskStateRunning {
+	if oldTask.DesiredState <= api.TaskStateCompleted {
 		nodeInfo.ActiveTasksCount--
 		nodeInfo.ActiveTasksCountByService[t.ServiceID]--
 	}
@@ -108,12 +108,12 @@ func (nodeInfo *NodeInfo) removeTask(t *api.Task) bool {
 func (nodeInfo *NodeInfo) addTask(t *api.Task) bool {
 	oldTask, ok := nodeInfo.Tasks[t.ID]
 	if ok {
-		if t.DesiredState <= api.TaskStateRunning && oldTask.DesiredState > api.TaskStateRunning {
+		if t.DesiredState <= api.TaskStateCompleted && oldTask.DesiredState > api.TaskStateCompleted {
 			nodeInfo.Tasks[t.ID] = t
 			nodeInfo.ActiveTasksCount++
 			nodeInfo.ActiveTasksCountByService[t.ServiceID]++
 			return true
-		} else if t.DesiredState > api.TaskStateRunning && oldTask.DesiredState <= api.TaskStateRunning {
+		} else if t.DesiredState > api.TaskStateCompleted && oldTask.DesiredState <= api.TaskStateCompleted {
 			nodeInfo.Tasks[t.ID] = t
 			nodeInfo.ActiveTasksCount--
 			nodeInfo.ActiveTasksCountByService[t.ServiceID]--
@@ -145,7 +145,7 @@ func (nodeInfo *NodeInfo) addTask(t *api.Task) bool {
 		}
 	}
 
-	if t.DesiredState <= api.TaskStateRunning {
+	if t.DesiredState <= api.TaskStateCompleted {
 		nodeInfo.ActiveTasksCount++
 		nodeInfo.ActiveTasksCountByService[t.ServiceID]++
 	}

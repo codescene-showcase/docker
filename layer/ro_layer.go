@@ -5,7 +5,7 @@ import (
 	"io"
 
 	"github.com/docker/distribution"
-	"github.com/opencontainers/go-digest"
+	digest "github.com/opencontainers/go-digest"
 )
 
 type roLayer struct {
@@ -52,6 +52,10 @@ func (rl *roLayer) TarStreamFrom(parent ChainID) (io.ReadCloser, error) {
 		return nil, fmt.Errorf("layer ID '%s' is not a parent of the specified layer: cannot provide diff to non-parent", parent)
 	}
 	return rl.layerStore.driver.Diff(rl.cacheID, parentCacheID)
+}
+
+func (rl *roLayer) CacheID() string {
+	return rl.cacheID
 }
 
 func (rl *roLayer) ChainID() ChainID {

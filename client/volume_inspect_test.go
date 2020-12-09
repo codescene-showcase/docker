@@ -11,10 +11,10 @@ import (
 	"testing"
 
 	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/internal/testutil"
-	"github.com/gotestyourself/gotestyourself/assert"
-	is "github.com/gotestyourself/gotestyourself/assert/cmp"
+	"github.com/docker/docker/errdefs"
 	"github.com/pkg/errors"
+	"gotest.tools/v3/assert"
+	is "gotest.tools/v3/assert/cmp"
 )
 
 func TestVolumeInspectError(t *testing.T) {
@@ -23,7 +23,9 @@ func TestVolumeInspectError(t *testing.T) {
 	}
 
 	_, err := client.VolumeInspect(context.Background(), "nothing")
-	testutil.ErrorContains(t, err, "Error response from daemon: Server error")
+	if !errdefs.IsSystem(err) {
+		t.Fatalf("expected a Server Error, got %[1]T: %[1]v", err)
+	}
 }
 
 func TestVolumeInspectNotFound(t *testing.T) {
@@ -60,7 +62,7 @@ func TestVolumeInspect(t *testing.T) {
 			if !strings.HasPrefix(req.URL.Path, expectedURL) {
 				return nil, fmt.Errorf("Expected URL '%s', got '%s'", expectedURL, req.URL)
 			}
-			if req.Method != "GET" {
+			if req.Method != http.MethodGet {
 				return nil, fmt.Errorf("expected GET method, got %s", req.Method)
 			}
 			content, err := json.Marshal(expected)

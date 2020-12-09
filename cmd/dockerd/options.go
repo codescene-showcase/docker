@@ -1,7 +1,6 @@
 package main
 
 import (
-	"fmt"
 	"os"
 	"path/filepath"
 
@@ -9,7 +8,6 @@ import (
 	"github.com/docker/docker/daemon/config"
 	"github.com/docker/docker/opts"
 	"github.com/docker/go-connections/tlsconfig"
-	"github.com/sirupsen/logrus"
 	"github.com/spf13/pflag"
 )
 
@@ -22,6 +20,10 @@ const (
 	DefaultCertFile = "cert.pem"
 	// FlagTLSVerify is the flag name for the TLS verification option
 	FlagTLSVerify = "tlsverify"
+	// FlagTLS is the flag name for the TLS option
+	FlagTLS = "tls"
+	// DefaultTLSValue is the default value used for setting the tls option for tcp connections
+	DefaultTLSValue = false
 )
 
 var (
@@ -30,7 +32,6 @@ var (
 )
 
 type daemonOptions struct {
-	version      bool
 	configFile   string
 	daemonConfig *config.Config
 	flags        *pflag.FlagSet
@@ -52,13 +53,15 @@ func newDaemonOptions(config *config.Config) *daemonOptions {
 // InstallFlags adds flags for the common options on the FlagSet
 func (o *daemonOptions) InstallFlags(flags *pflag.FlagSet) {
 	if dockerCertPath == "" {
+		// cliconfig.Dir returns $DOCKER_CONFIG or ~/.docker.
+		// cliconfig.Dir does not look up $XDG_CONFIG_HOME
 		dockerCertPath = cliconfig.Dir()
 	}
 
 	flags.BoolVarP(&o.Debug, "debug", "D", false, "Enable debug mode")
 	flags.StringVarP(&o.LogLevel, "log-level", "l", "info", `Set the logging level ("debug"|"info"|"warn"|"error"|"fatal")`)
-	flags.BoolVar(&o.TLS, "tls", false, "Use TLS; implied by --tlsverify")
-	flags.BoolVar(&o.TLSVerify, FlagTLSVerify, dockerTLSVerify, "Use TLS and verify the remote")
+	flags.BoolVar(&o.TLS, FlagTLS, DefaultTLSValue, "Use TLS; implied by --tlsverify")
+	flags.BoolVar(&o.TLSVerify, FlagTLSVerify, dockerTLSVerify || DefaultTLSValue, "Use TLS and verify the remote")
 
 	// TODO use flag flags.String("identity"}, "i", "", "Path to libtrust key file")
 
@@ -87,6 +90,11 @@ func (o *daemonOptions) SetDefaultOptions(flags *pflag.FlagSet) {
 		o.TLS = true
 	}
 
+	if o.TLS && !flags.Changed(FlagTLSVerify) {
+		// Enable tls verification unless explicitly disabled
+		o.TLSVerify = true
+	}
+
 	if !o.TLS {
 		o.TLSOptions = nil
 	} else {
@@ -105,19 +113,5 @@ func (o *daemonOptions) SetDefaultOptions(flags *pflag.FlagSet) {
 				tlsOptions.KeyFile = ""
 			}
 		}
-	}
-}
-
-// setLogLevel sets the logrus logging level
-func setLogLevel(logLevel string) {
-	if logLevel != "" {
-		lvl, err := logrus.ParseLevel(logLevel)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Unable to parse logging level: %s\n", logLevel)
-			os.Exit(1)
-		}
-		logrus.SetLevel(lvl)
-	} else {
-		logrus.SetLevel(logrus.InfoLevel)
 	}
 }

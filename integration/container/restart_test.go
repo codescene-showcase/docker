@@ -8,13 +8,15 @@ import (
 
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/internal/test/daemon"
-	"github.com/gotestyourself/gotestyourself/assert"
-	"github.com/gotestyourself/gotestyourself/skip"
+	"github.com/docker/docker/testutil/daemon"
+	"gotest.tools/v3/assert"
+	"gotest.tools/v3/skip"
 )
 
 func TestDaemonRestartKillContainers(t *testing.T) {
 	skip.If(t, testEnv.IsRemoteDaemon, "cannot start daemon on remote test run")
+	skip.If(t, testEnv.DaemonInfo.OSType == "windows")
+	skip.If(t, testEnv.IsRootless, "rootless mode doesn't support live-restore")
 	type testCase struct {
 		desc       string
 		config     *container.Config
@@ -25,7 +27,7 @@ func TestDaemonRestartKillContainers(t *testing.T) {
 		xStart              bool
 	}
 
-	for _, c := range []testCase{
+	for _, tc := range []testCase{
 		{
 			desc:                "container without restart policy",
 			config:              &container.Config{Image: "busybox", Cmd: []string{"top"}},
@@ -56,16 +58,15 @@ func TestDaemonRestartKillContainers(t *testing.T) {
 					d.Stop(t)
 				},
 			} {
-				t.Run(fmt.Sprintf("live-restore=%v/%s/%s", liveRestoreEnabled, c.desc, fnName), func(t *testing.T) {
-					c := c
+				t.Run(fmt.Sprintf("live-restore=%v/%s/%s", liveRestoreEnabled, tc.desc, fnName), func(t *testing.T) {
+					c := tc
 					liveRestoreEnabled := liveRestoreEnabled
 					stopDaemon := stopDaemon
 
 					t.Parallel()
 
 					d := daemon.New(t)
-					client, err := d.NewClient()
-					assert.NilError(t, err)
+					client := d.NewClientT(t)
 
 					args := []string{"--iptables=false"}
 					if liveRestoreEnabled {
@@ -76,7 +77,7 @@ func TestDaemonRestartKillContainers(t *testing.T) {
 					defer d.Stop(t)
 					ctx := context.Background()
 
-					resp, err := client.ContainerCreate(ctx, c.config, c.hostConfig, nil, "")
+					resp, err := client.ContainerCreate(ctx, c.config, c.hostConfig, nil, nil, "")
 					assert.NilError(t, err)
 					defer client.ContainerRemove(ctx, resp.ID, types.ContainerRemoveOptions{Force: true})
 

@@ -9,7 +9,7 @@ import (
 
 	containerpkg "github.com/docker/docker/container"
 	"github.com/docker/docker/errdefs"
-	"github.com/docker/docker/libcontainerd"
+	libcontainerdtypes "github.com/docker/docker/libcontainerd/types"
 	"github.com/docker/docker/pkg/signal"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
@@ -64,8 +64,6 @@ func (daemon *Daemon) killWithSignal(container *containerpkg.Container, sig int)
 	container.Lock()
 	defer container.Unlock()
 
-	daemon.stopHealthchecks(container)
-
 	if !container.Running {
 		return errNotRunning(container.ID)
 	}
@@ -87,6 +85,7 @@ func (daemon *Daemon) killWithSignal(container *containerpkg.Container, sig int)
 
 	if !daemon.IsShuttingDown() {
 		container.HasBeenManuallyStopped = true
+		container.CheckpointTo(daemon.containersReplica)
 	}
 
 	// if the container is currently restarting we do not need to send the signal
@@ -100,6 +99,19 @@ func (daemon *Daemon) killWithSignal(container *containerpkg.Container, sig int)
 		if errdefs.IsNotFound(err) {
 			unpause = false
 			logrus.WithError(err).WithField("container", container.ID).WithField("action", "kill").Debug("container kill failed because of 'container not found' or 'no such process'")
+			go func() {
+				// We need to clean up this container but it is possible there is a case where we hit here before the exit event is processed
+				// but after it was fired off.
+				// So let's wait the container's stop timeout amount of time to see if the event is eventually processed.
+				// Doing this has the side effect that if no event was ever going to come we are waiting a a longer period of time uneccessarily.
+				// But this prevents race conditions in processing the container.
+				ctx, cancel := context.WithTimeout(context.TODO(), time.Duration(container.StopTimeout())*time.Second)
+				defer cancel()
+				s := <-container.Wait(ctx, containerpkg.WaitConditionNotRunning)
+				if s.Err() != nil {
+					daemon.handleContainerExit(container, nil)
+				}
+			}()
 		} else {
 			return errors.Wrapf(err, "Cannot kill container %s", container.ID)
 		}
@@ -108,7 +120,7 @@ func (daemon *Daemon) killWithSignal(container *containerpkg.Container, sig int)
 	if unpause {
 		// above kill signal will be sent once resume is finished
 		if err := daemon.containerd.Resume(context.Background(), container.ID); err != nil {
-			logrus.Warn("Cannot unpause container %s: %s", container.ID, err)
+			logrus.Warnf("Cannot unpause container %s: %s", container.ID, err)
 		}
 	}
 
@@ -176,5 +188,5 @@ func (daemon *Daemon) killPossiblyDeadProcess(container *containerpkg.Container,
 }
 
 func (daemon *Daemon) kill(c *containerpkg.Container, sig int) error {
-	return daemon.containerd.SignalProcess(context.Background(), c.ID, libcontainerd.InitProcessName, sig)
+	return daemon.containerd.SignalProcess(context.Background(), c.ID, libcontainerdtypes.InitProcessName, sig)
 }

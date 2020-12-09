@@ -11,18 +11,19 @@ import (
 	"reflect"
 	"runtime"
 
+	"github.com/containerd/containerd/platforms"
 	"github.com/docker/distribution"
 	"github.com/docker/distribution/reference"
 	"github.com/docker/docker/image"
-	"github.com/docker/docker/image/v1"
+	v1 "github.com/docker/docker/image/v1"
 	"github.com/docker/docker/layer"
 	"github.com/docker/docker/pkg/archive"
 	"github.com/docker/docker/pkg/chrootarchive"
 	"github.com/docker/docker/pkg/progress"
 	"github.com/docker/docker/pkg/streamformatter"
 	"github.com/docker/docker/pkg/stringid"
-	"github.com/docker/docker/pkg/symlink"
 	"github.com/docker/docker/pkg/system"
+	"github.com/moby/sys/symlink"
 	digest "github.com/opencontainers/go-digest"
 	"github.com/sirupsen/logrus"
 )
@@ -421,9 +422,11 @@ func checkCompatibleOS(imageOS string) error {
 	if runtime.GOOS != "windows" && imageOS == "windows" {
 		return fmt.Errorf("cannot load %s image on %s", imageOS, runtime.GOOS)
 	}
-	// Finally, check the image OS is supported for the platform.
-	if err := system.ValidatePlatform(system.ParsePlatform(imageOS)); err != nil {
-		return fmt.Errorf("cannot load %s image on %s: %s", imageOS, runtime.GOOS, err)
+
+	p, err := platforms.Parse(imageOS)
+	if err != nil {
+		return err
 	}
-	return nil
+
+	return system.ValidatePlatform(p)
 }

@@ -8,21 +8,17 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/opencontainers/runc/libcontainer/system"
+	"golang.org/x/sys/unix"
 )
 
-/*
-#include <unistd.h>
-*/
-import "C"
-
-// platformNewStatsCollector performs platform specific initialisation of the
-// Collector structure.
-func platformNewStatsCollector(s *Collector) {
-	s.clockTicksPerSecond = uint64(system.GetClockTicks())
-}
-
-const nanoSecondsPerSecond = 1e9
+const (
+	// The value comes from `C.sysconf(C._SC_CLK_TCK)`, and
+	// on Linux it's a constant which is safe to be hard coded,
+	// so we can avoid using cgo here. For details, see:
+	// https://github.com/containerd/cgroups/pull/12
+	clockTicksPerSecond  = 100
+	nanoSecondsPerSecond = 1e9
+)
 
 // getSystemCPUUsage returns the host system's cpu usage in
 // nanoseconds. An error is returned if the format of the underlying
@@ -33,7 +29,6 @@ const nanoSecondsPerSecond = 1e9
 // provided. See `man 5 proc` for details on specific field
 // information.
 func (s *Collector) getSystemCPUUsage() (uint64, error) {
-	var line string
 	f, err := os.Open("/proc/stat")
 	if err != nil {
 		return 0, err
@@ -43,9 +38,9 @@ func (s *Collector) getSystemCPUUsage() (uint64, error) {
 		f.Close()
 	}()
 	s.bufReader.Reset(f)
-	err = nil
-	for err == nil {
-		line, err = s.bufReader.ReadString('\n')
+
+	for {
+		line, err := s.bufReader.ReadString('\n')
 		if err != nil {
 			break
 		}
@@ -64,20 +59,17 @@ func (s *Collector) getSystemCPUUsage() (uint64, error) {
 				totalClockTicks += v
 			}
 			return (totalClockTicks * nanoSecondsPerSecond) /
-				s.clockTicksPerSecond, nil
+				clockTicksPerSecond, nil
 		}
 	}
 	return 0, fmt.Errorf("invalid stat format. Error trying to parse the '/proc/stat' file")
 }
 
 func (s *Collector) getNumberOnlineCPUs() (uint32, error) {
-	i, err := C.sysconf(C._SC_NPROCESSORS_ONLN)
-	// According to POSIX - errno is undefined after successful
-	// sysconf, and can be non-zero in several cases, so look for
-	// error in returned value not in errno.
-	// (https://sourceware.org/bugzilla/show_bug.cgi?id=21536)
-	if i == -1 {
+	var cpuset unix.CPUSet
+	err := unix.SchedGetaffinity(0, &cpuset)
+	if err != nil {
 		return 0, err
 	}
-	return uint32(i), nil
+	return uint32(cpuset.Count()), nil
 }

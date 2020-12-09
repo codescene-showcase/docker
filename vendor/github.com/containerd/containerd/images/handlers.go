@@ -19,12 +19,15 @@ package images
 import (
 	"context"
 	"fmt"
+	"sort"
 
 	"github.com/containerd/containerd/content"
+	"github.com/containerd/containerd/errdefs"
 	"github.com/containerd/containerd/platforms"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
 	"golang.org/x/sync/errgroup"
+	"golang.org/x/sync/semaphore"
 )
 
 var (
@@ -61,7 +64,7 @@ func Handlers(handlers ...Handler) HandlerFunc {
 		for _, handler := range handlers {
 			ch, err := handler.Handle(ctx, desc)
 			if err != nil {
-				if errors.Cause(err) == ErrStopHandler {
+				if errors.Is(err, ErrStopHandler) {
 					break
 				}
 				return nil, err
@@ -84,7 +87,7 @@ func Walk(ctx context.Context, handler Handler, descs ...ocispec.Descriptor) err
 
 		children, err := handler.Handle(ctx, desc)
 		if err != nil {
-			if errors.Cause(err) == ErrSkipDesc {
+			if errors.Is(err, ErrSkipDesc) {
 				continue // don't traverse the children.
 			}
 			return err
@@ -107,28 +110,40 @@ func Walk(ctx context.Context, handler Handler, descs ...ocispec.Descriptor) err
 // handler may return `ErrSkipDesc` to signal to the dispatcher to not traverse
 // any children.
 //
+// A concurrency limiter can be passed in to limit the number of concurrent
+// handlers running. When limiter is nil, there is no limit.
+//
 // Typically, this function will be used with `FetchHandler`, often composed
 // with other handlers.
 //
 // If any handler returns an error, the dispatch session will be canceled.
-func Dispatch(ctx context.Context, handler Handler, descs ...ocispec.Descriptor) error {
-	eg, ctx := errgroup.WithContext(ctx)
+func Dispatch(ctx context.Context, handler Handler, limiter *semaphore.Weighted, descs ...ocispec.Descriptor) error {
+	eg, ctx2 := errgroup.WithContext(ctx)
 	for _, desc := range descs {
 		desc := desc
+
+		if limiter != nil {
+			if err := limiter.Acquire(ctx, 1); err != nil {
+				return err
+			}
+		}
 
 		eg.Go(func() error {
 			desc := desc
 
-			children, err := handler.Handle(ctx, desc)
+			children, err := handler.Handle(ctx2, desc)
+			if limiter != nil {
+				limiter.Release(1)
+			}
 			if err != nil {
-				if errors.Cause(err) == ErrSkipDesc {
+				if errors.Is(err, ErrSkipDesc) {
 					return nil // don't traverse the children.
 				}
 				return err
 			}
 
 			if len(children) > 0 {
-				return Dispatch(ctx, handler, children...)
+				return Dispatch(ctx2, handler, limiter, children...)
 			}
 
 			return nil
@@ -155,6 +170,19 @@ func ChildrenHandler(provider content.Provider) HandlerFunc {
 // the children returned by the handler and passes through the children.
 // Must follow a handler that returns the children to be labeled.
 func SetChildrenLabels(manager content.Manager, f HandlerFunc) HandlerFunc {
+	return SetChildrenMappedLabels(manager, f, nil)
+}
+
+// SetChildrenMappedLabels is a handler wrapper which sets labels for the content on
+// the children returned by the handler and passes through the children.
+// Must follow a handler that returns the children to be labeled.
+// The label map allows the caller to control the labels per child descriptor.
+// For returned labels, the index of the child will be appended to the end
+// except for the first index when the returned label does not end with '.'.
+func SetChildrenMappedLabels(manager content.Manager, f HandlerFunc, labelMap func(ocispec.Descriptor) []string) HandlerFunc {
+	if labelMap == nil {
+		labelMap = ChildGCLabels
+	}
 	return func(ctx context.Context, desc ocispec.Descriptor) ([]ocispec.Descriptor, error) {
 		children, err := f(ctx, desc)
 		if err != nil {
@@ -162,14 +190,26 @@ func SetChildrenLabels(manager content.Manager, f HandlerFunc) HandlerFunc {
 		}
 
 		if len(children) > 0 {
-			info := content.Info{
-				Digest: desc.Digest,
-				Labels: map[string]string{},
-			}
-			fields := []string{}
-			for i, ch := range children {
-				info.Labels[fmt.Sprintf("containerd.io/gc.ref.content.%d", i)] = ch.Digest.String()
-				fields = append(fields, fmt.Sprintf("labels.containerd.io/gc.ref.content.%d", i))
+			var (
+				info = content.Info{
+					Digest: desc.Digest,
+					Labels: map[string]string{},
+				}
+				fields = []string{}
+				keys   = map[string]uint{}
+			)
+			for _, ch := range children {
+				labelKeys := labelMap(ch)
+				for _, key := range labelKeys {
+					idx := keys[key]
+					keys[key] = idx + 1
+					if idx > 0 || key[len(key)-1] == '.' {
+						key = fmt.Sprintf("%s%d", key, idx)
+					}
+
+					info.Labels[key] = ch.Digest.String()
+					fields = append(fields, "labels."+key)
+				}
 			}
 
 			_, err := manager.Update(ctx, info, fields...)
@@ -182,9 +222,9 @@ func SetChildrenLabels(manager content.Manager, f HandlerFunc) HandlerFunc {
 	}
 }
 
-// FilterPlatform is a handler wrapper which limits the descriptors returned
-// by a handler to a single platform.
-func FilterPlatform(platform string, f HandlerFunc) HandlerFunc {
+// FilterPlatforms is a handler wrapper which limits the descriptors returned
+// based on matching the specified platform matcher.
+func FilterPlatforms(f HandlerFunc, m platforms.Matcher) HandlerFunc {
 	return func(ctx context.Context, desc ocispec.Descriptor) ([]ocispec.Descriptor, error) {
 		children, err := f(ctx, desc)
 		if err != nil {
@@ -192,31 +232,57 @@ func FilterPlatform(platform string, f HandlerFunc) HandlerFunc {
 		}
 
 		var descs []ocispec.Descriptor
-		if platform != "" && isMultiPlatform(desc.MediaType) {
-			matcher, err := platforms.Parse(platform)
-			if err != nil {
-				return nil, err
-			}
 
+		if m == nil {
+			descs = children
+		} else {
 			for _, d := range children {
-				if d.Platform == nil || matcher.Match(*d.Platform) {
+				if d.Platform == nil || m.Match(*d.Platform) {
 					descs = append(descs, d)
 				}
 			}
-		} else {
-			descs = children
 		}
 
 		return descs, nil
 	}
-
 }
 
-func isMultiPlatform(mediaType string) bool {
-	switch mediaType {
-	case MediaTypeDockerSchema2ManifestList, ocispec.MediaTypeImageIndex:
-		return true
-	default:
-		return false
+// LimitManifests is a handler wrapper which filters the manifest descriptors
+// returned using the provided platform.
+// The results will be ordered according to the comparison operator and
+// use the ordering in the manifests for equal matches.
+// A limit of 0 or less is considered no limit.
+// A not found error is returned if no manifest is matched.
+func LimitManifests(f HandlerFunc, m platforms.MatchComparer, n int) HandlerFunc {
+	return func(ctx context.Context, desc ocispec.Descriptor) ([]ocispec.Descriptor, error) {
+		children, err := f(ctx, desc)
+		if err != nil {
+			return children, err
+		}
+
+		switch desc.MediaType {
+		case ocispec.MediaTypeImageIndex, MediaTypeDockerSchema2ManifestList:
+			sort.SliceStable(children, func(i, j int) bool {
+				if children[i].Platform == nil {
+					return false
+				}
+				if children[j].Platform == nil {
+					return true
+				}
+				return m.Less(*children[i].Platform, *children[j].Platform)
+			})
+
+			if n > 0 {
+				if len(children) == 0 {
+					return children, errors.Wrap(errdefs.ErrNotFound, "no match for platform in manifest")
+				}
+				if len(children) > n {
+					children = children[:n]
+				}
+			}
+		default:
+			// only limit manifests from an index
+		}
+		return children, nil
 	}
 }

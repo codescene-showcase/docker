@@ -19,12 +19,12 @@ import (
 	"github.com/docker/docker/daemon/graphdriver/vfs"
 	"github.com/docker/docker/integration/internal/container"
 	"github.com/docker/docker/integration/internal/requirement"
-	"github.com/docker/docker/internal/test/daemon"
 	"github.com/docker/docker/pkg/archive"
 	"github.com/docker/docker/pkg/plugins"
-	"github.com/gotestyourself/gotestyourself/assert"
-	is "github.com/gotestyourself/gotestyourself/assert/cmp"
-	"github.com/gotestyourself/gotestyourself/skip"
+	"github.com/docker/docker/testutil/daemon"
+	"gotest.tools/v3/assert"
+	is "gotest.tools/v3/assert/cmp"
+	"gotest.tools/v3/skip"
 )
 
 type graphEventsCounter struct {
@@ -48,13 +48,14 @@ func TestExternalGraphDriver(t *testing.T) {
 	skip.If(t, runtime.GOOS == "windows")
 	skip.If(t, testEnv.IsRemoteDaemon, "cannot run daemon when remote daemon")
 	skip.If(t, !requirement.HasHubConnectivity(t))
+	skip.If(t, testEnv.IsRootless, "rootless mode doesn't support external graph driver")
 
 	// Setup plugin(s)
 	ec := make(map[string]*graphEventsCounter)
 	sserver := setupPluginViaSpecFile(t, ec)
 	jserver := setupPluginViaJSONFile(t, ec)
 	// Create daemon
-	d := daemon.New(t, daemon.WithExperimental)
+	d := daemon.New(t, daemon.WithExperimental())
 	c := d.NewClientT(t)
 
 	for _, tc := range []struct {
@@ -360,7 +361,7 @@ func testExternalGraphDriver(ext string, ec map[string]*graphEventsCounter) func
 
 			ctx := context.Background()
 
-			testGraphDriver(t, c, ctx, driverName, func(t *testing.T) {
+			testGraphDriver(ctx, t, c, driverName, func(t *testing.T) {
 				d.Restart(t, "-s", driverName)
 			})
 
@@ -394,12 +395,12 @@ func testGraphDriverPull(c client.APIClient, d *daemon.Daemon) func(*testing.T) 
 		defer d.Stop(t)
 		ctx := context.Background()
 
-		r, err := c.ImagePull(ctx, "busybox:latest", types.ImagePullOptions{})
+		r, err := c.ImagePull(ctx, "busybox:latest@sha256:95cf004f559831017cdf4628aaf1bb30133677be8702a8c5f2994629f637a209", types.ImagePullOptions{})
 		assert.NilError(t, err)
 		_, err = io.Copy(ioutil.Discard, r)
 		assert.NilError(t, err)
 
-		container.Run(t, ctx, c, container.WithImage("busybox:latest"))
+		container.Run(ctx, t, c, container.WithImage("busybox:latest@sha256:95cf004f559831017cdf4628aaf1bb30133677be8702a8c5f2994629f637a209"))
 	}
 }
 
@@ -410,7 +411,7 @@ func TestGraphdriverPluginV2(t *testing.T) {
 	skip.If(t, os.Getenv("DOCKER_ENGINE_GOARCH") != "amd64")
 	skip.If(t, !requirement.Overlay2Supported(testEnv.DaemonInfo.KernelVersion))
 
-	d := daemon.New(t, daemon.WithExperimental)
+	d := daemon.New(t, daemon.WithExperimental())
 	d.Start(t)
 	defer d.Stop(t)
 
@@ -424,8 +425,8 @@ func TestGraphdriverPluginV2(t *testing.T) {
 		RemoteRef:            plugin,
 		AcceptAllPermissions: true,
 	})
-	defer responseReader.Close()
 	assert.NilError(t, err)
+	defer responseReader.Close()
 	// ensure it's done by waiting for EOF on the response
 	_, err = io.Copy(ioutil.Discard, responseReader)
 	assert.NilError(t, err)
@@ -434,11 +435,11 @@ func TestGraphdriverPluginV2(t *testing.T) {
 	d.Stop(t)
 	d.StartWithBusybox(t, "-s", plugin, "--storage-opt", "overlay2.override_kernel_check=1")
 
-	testGraphDriver(t, client, ctx, plugin, nil)
+	testGraphDriver(ctx, t, client, plugin, nil)
 }
 
-func testGraphDriver(t *testing.T, c client.APIClient, ctx context.Context, driverName string, afterContainerRunFn func(*testing.T)) { //nolint: golint
-	id := container.Run(t, ctx, c, container.WithCmd("sh", "-c", "echo hello > /hello"))
+func testGraphDriver(ctx context.Context, t *testing.T, c client.APIClient, driverName string, afterContainerRunFn func(*testing.T)) {
+	id := container.Run(ctx, t, c, container.WithCmd("sh", "-c", "echo hello > /hello"))
 
 	if afterContainerRunFn != nil {
 		afterContainerRunFn(t)

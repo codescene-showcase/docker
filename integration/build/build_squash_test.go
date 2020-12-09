@@ -9,18 +9,30 @@ import (
 	"testing"
 
 	"github.com/docker/docker/api/types"
+	dclient "github.com/docker/docker/client"
 	"github.com/docker/docker/integration/internal/container"
-	"github.com/docker/docker/internal/test/fakecontext"
 	"github.com/docker/docker/pkg/stdcopy"
-	"github.com/gotestyourself/gotestyourself/assert"
-	is "github.com/gotestyourself/gotestyourself/assert/cmp"
-	"github.com/gotestyourself/gotestyourself/skip"
+	"github.com/docker/docker/testutil/daemon"
+	"github.com/docker/docker/testutil/fakecontext"
+	"gotest.tools/v3/assert"
+	is "gotest.tools/v3/assert/cmp"
+	"gotest.tools/v3/skip"
 )
 
 func TestBuildSquashParent(t *testing.T) {
-	skip.If(t, !testEnv.DaemonInfo.ExperimentalBuild)
+	skip.If(t, testEnv.DaemonInfo.OSType == "windows")
 
-	client := testEnv.APIClient()
+	var client dclient.APIClient
+	if !testEnv.DaemonInfo.ExperimentalBuild {
+		skip.If(t, testEnv.IsRemoteDaemon, "cannot run daemon when remote daemon")
+
+		d := daemon.New(t, daemon.WithExperimental())
+		d.StartWithBusybox(t)
+		defer d.Stop(t)
+		client = d.NewClientT(t)
+	} else {
+		client = testEnv.APIClient()
+	}
 
 	dockerfile := `
 		FROM busybox
@@ -36,7 +48,7 @@ func TestBuildSquashParent(t *testing.T) {
 	source := fakecontext.New(t, "", fakecontext.WithDockerfile(dockerfile))
 	defer source.Close()
 
-	name := "test"
+	name := strings.ToLower(t.Name())
 	resp, err := client.ImageBuild(ctx,
 		source.AsTarReader(t),
 		types.ImageBuildOptions{
@@ -67,7 +79,7 @@ func TestBuildSquashParent(t *testing.T) {
 	resp.Body.Close()
 	assert.NilError(t, err)
 
-	cid := container.Run(t, ctx, client,
+	cid := container.Run(ctx, t, client,
 		container.WithImage(name),
 		container.WithCmd("/bin/sh", "-c", "cat /hello"),
 	)
@@ -82,13 +94,13 @@ func TestBuildSquashParent(t *testing.T) {
 	assert.NilError(t, err)
 	assert.Check(t, is.Equal(strings.TrimSpace(actualStdout.String()), "hello\nworld"))
 
-	container.Run(t, ctx, client,
+	container.Run(ctx, t, client,
 		container.WithImage(name),
 		container.WithCmd("/bin/sh", "-c", "[ ! -f /remove_me ]"),
 	)
-	container.Run(t, ctx, client,
+	container.Run(ctx, t, client,
 		container.WithImage(name),
-		container.WithCmd("/bin/sh", "-c", `[ "$(echo $HELLO)" == "world" ]`),
+		container.WithCmd("/bin/sh", "-c", `[ "$(echo $HELLO)" = "world" ]`),
 	)
 
 	origHistory, err := client.ImageHistory(ctx, origID)

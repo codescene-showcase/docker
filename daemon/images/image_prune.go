@@ -3,17 +3,20 @@ package images // import "github.com/docker/docker/daemon/images"
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"sync/atomic"
 	"time"
 
 	"github.com/docker/distribution/reference"
 	"github.com/docker/docker/api/types"
+	"github.com/docker/docker/api/types/events"
 	"github.com/docker/docker/api/types/filters"
 	timetypes "github.com/docker/docker/api/types/time"
 	"github.com/docker/docker/errdefs"
 	"github.com/docker/docker/image"
 	"github.com/docker/docker/layer"
 	digest "github.com/opencontainers/go-digest"
+	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 )
 
@@ -26,7 +29,7 @@ var imagesAcceptedFilters = map[string]bool{
 
 // errPruneRunning is returned when a prune request is received while
 // one is in progress
-var errPruneRunning = fmt.Errorf("a prune operation is already running")
+var errPruneRunning = errdefs.Conflict(errors.New("a prune operation is already running"))
 
 // ImagesPrune removes unused images
 func (i *ImageService) ImagesPrune(ctx context.Context, pruneFilters filters.Args) (*types.ImagesPruneReport, error) {
@@ -158,7 +161,11 @@ deleteImagesLoop:
 	if canceled {
 		logrus.Debugf("ImagesPrune operation cancelled: %#v", *rep)
 	}
-
+	i.eventsService.Log("prune", events.ImageEventType, events.Actor{
+		Attributes: map[string]string{
+			"reclaimed": strconv.FormatUint(rep.SpaceReclaimed, 10),
+		},
+	})
 	return rep, nil
 }
 

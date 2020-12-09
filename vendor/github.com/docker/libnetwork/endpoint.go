@@ -1,7 +1,6 @@
 package libnetwork
 
 import (
-	"container/heap"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -499,11 +498,14 @@ func (ep *endpoint) sbJoin(sb *sandbox, options ...EndpointOption) (err error) {
 	}
 
 	if doUpdateHostsFile(n, sb) {
-		address := ""
-		if ip := ep.getFirstInterfaceAddress(); ip != nil {
-			address = ip.String()
+		var addresses []string
+		if ip := ep.getFirstInterfaceIPv4Address(); ip != nil {
+			addresses = append(addresses, ip.String())
 		}
-		if err = sb.updateHostsFile(address); err != nil {
+		if ip := ep.getFirstInterfaceIPv6Address(); ip != nil {
+			addresses = append(addresses, ip.String())
+		}
+		if err = sb.updateHostsFile(addresses); err != nil {
 			return err
 		}
 	}
@@ -514,9 +516,7 @@ func (ep *endpoint) sbJoin(sb *sandbox, options ...EndpointOption) (err error) {
 	// Current endpoint providing external connectivity for the sandbox
 	extEp := sb.getGatewayEndpoint()
 
-	sb.Lock()
-	heap.Push(&sb.endpoints, ep)
-	sb.Unlock()
+	sb.addEndpoint(ep)
 	defer func() {
 		if err != nil {
 			sb.removeEndpoint(ep)
@@ -542,6 +542,12 @@ func (ep *endpoint) sbJoin(sb *sandbox, options ...EndpointOption) (err error) {
 			}
 		}
 	}()
+
+	// Load balancing endpoints should never have a default gateway nor
+	// should they alter the status of a network's default gateway
+	if ep.loadBalancer && !sb.ingress {
+		return nil
+	}
 
 	if sb.needDefaultGW() && sb.getEndpointInGWNetwork() == nil {
 		return sb.setupDefaultGW()
@@ -755,10 +761,8 @@ func (ep *endpoint) sbLeave(sb *sandbox, force bool, options ...EndpointOption) 
 		}
 	}
 
-	if ep.svcID != "" {
-		if err := ep.deleteServiceInfoFromCluster(sb, true, "sbLeave"); err != nil {
-			logrus.Warnf("Failed to clean up service info on container %s disconnect: %v", ep.name, err)
-		}
+	if err := ep.deleteServiceInfoFromCluster(sb, true, "sbLeave"); err != nil {
+		logrus.Warnf("Failed to clean up service info on container %s disconnect: %v", ep.name, err)
 	}
 
 	if err := sb.clearNetworkResources(ep); err != nil {
@@ -911,12 +915,23 @@ func (ep *endpoint) getSandbox() (*sandbox, bool) {
 	return ps, ok
 }
 
-func (ep *endpoint) getFirstInterfaceAddress() net.IP {
+func (ep *endpoint) getFirstInterfaceIPv4Address() net.IP {
 	ep.Lock()
 	defer ep.Unlock()
 
 	if ep.iface.addr != nil {
 		return ep.iface.addr.IP
+	}
+
+	return nil
+}
+
+func (ep *endpoint) getFirstInterfaceIPv6Address() net.IP {
+	ep.Lock()
+	defer ep.Unlock()
+
+	if ep.iface.addrv6 != nil {
+		return ep.iface.addrv6.IP
 	}
 
 	return nil
@@ -1040,7 +1055,7 @@ func CreateOptionLoadBalancer() EndpointOption {
 
 // JoinOptionPriority function returns an option setter for priority option to
 // be passed to the endpoint.Join() method.
-func JoinOptionPriority(ep Endpoint, prio int) EndpointOption {
+func JoinOptionPriority(prio int) EndpointOption {
 	return func(ep *endpoint) {
 		// ep lock already acquired
 		c := ep.network.getController()

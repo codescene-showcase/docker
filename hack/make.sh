@@ -24,33 +24,9 @@ set -e
 set -o pipefail
 
 export DOCKER_PKG='github.com/docker/docker'
-export SCRIPTDIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+export SCRIPTDIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export MAKEDIR="$SCRIPTDIR/make"
 export PKG_CONFIG=${PKG_CONFIG:-pkg-config}
-
-# We're a nice, sexy, little shell script, and people might try to run us;
-# but really, they shouldn't. We want to be in a container!
-inContainer="AssumeSoInitially"
-if [ "$(go env GOHOSTOS)" = 'windows' ]; then
-	if [ -z "$FROM_DOCKERFILE" ]; then
-		unset inContainer
-	fi
-else
-	if [ "$PWD" != "/go/src/$DOCKER_PKG" ]; then
-		unset inContainer
-	fi
-fi
-
-if [ -z "$inContainer" ]; then
-	{
-		echo "# WARNING! I don't seem to be running in a Docker container."
-		echo "# The result of this command might be an incorrect build, and will not be"
-		echo "# officially supported."
-		echo "#"
-		echo "# Try this instead: make all"
-		echo "#"
-	} >&2
-fi
 
 echo
 
@@ -58,10 +34,8 @@ echo
 DEFAULT_BUNDLES=(
 	binary-daemon
 	dynbinary
-
 	test-integration
 	test-docker-py
-
 	cross
 )
 
@@ -109,28 +83,21 @@ add_buildtag() {
 	[[ " $DOCKER_BUILDTAGS" == *" $1_"* ]] || DOCKER_BUILDTAGS+=" $1_$2"
 }
 
-if ${PKG_CONFIG} 'libsystemd >= 209' 2> /dev/null ; then
+if ${PKG_CONFIG} 'libsystemd >= 209' 2> /dev/null; then
 	DOCKER_BUILDTAGS+=" journald"
-elif ${PKG_CONFIG} 'libsystemd-journal' 2> /dev/null ; then
+elif ${PKG_CONFIG} 'libsystemd-journal' 2> /dev/null; then
 	DOCKER_BUILDTAGS+=" journald journald_compat"
-fi
-
-# test whether "btrfs/version.h" exists and apply btrfs_noversion appropriately
-if \
-	command -v gcc &> /dev/null \
-	&& ! gcc -E - -o /dev/null &> /dev/null <<<'#include <btrfs/version.h>' \
-; then
-	DOCKER_BUILDTAGS+=' btrfs_noversion'
 fi
 
 # test whether "libdevmapper.h" is new enough to support deferred remove
 # functionality. We favour libdm_dlsym_deferred_remove over
 # libdm_no_deferred_remove in dynamic cases because the binary could be shipped
-# with a newer libdevmapper than the one it was built wih.
-if \
+# with a newer libdevmapper than the one it was built with.
+if
 	command -v gcc &> /dev/null \
-	&& ! ( echo -e  '#include <libdevmapper.h>\nint main() { dm_task_deferred_remove(NULL); }'| gcc -xc - -o /dev/null $(pkg-config --libs devmapper) &> /dev/null ) \
-; then
+		&& ! (echo -e '#include <libdevmapper.h>\nint main() { dm_task_deferred_remove(NULL); }' | gcc -xc - -o /dev/null $(pkg-config --libs devmapper) &> /dev/null) \
+		;
+then
 	add_buildtag libdm dlsym_deferred_remove
 fi
 
@@ -145,27 +112,10 @@ LDFLAGS_STATIC=''
 EXTLDFLAGS_STATIC='-static'
 # ORIG_BUILDFLAGS is necessary for the cross target which cannot always build
 # with options like -race.
-ORIG_BUILDFLAGS=( -tags "autogen netgo static_build $DOCKER_BUILDTAGS" -installsuffix netgo )
+ORIG_BUILDFLAGS=(-tags "netgo osusergo static_build $DOCKER_BUILDTAGS" -installsuffix netgo)
 # see https://github.com/golang/go/issues/9369#issuecomment-69864440 for why -installsuffix is necessary here
 
-# When $DOCKER_INCREMENTAL_BINARY is set in the environment, enable incremental
-# builds by installing dependent packages to the GOPATH.
-REBUILD_FLAG="-a"
-if [ "$DOCKER_INCREMENTAL_BINARY" == "1" ] || [ "$DOCKER_INCREMENTAL_BINARY" == "true" ]; then
-	REBUILD_FLAG="-i"
-fi
-ORIG_BUILDFLAGS+=( $REBUILD_FLAG )
-
-BUILDFLAGS=( $BUILDFLAGS "${ORIG_BUILDFLAGS[@]}" )
-
-# Test timeout.
-if [ "${DOCKER_ENGINE_GOARCH}" == "arm" ]; then
-	: ${TIMEOUT:=10m}
-elif [ "${DOCKER_ENGINE_GOARCH}" == "windows" ]; then
-	: ${TIMEOUT:=8m}
-else
-	: ${TIMEOUT:=5m}
-fi
+BUILDFLAGS=(${BUILDFLAGS} "${ORIG_BUILDFLAGS[@]}")
 
 LDFLAGS_STATIC_DOCKER="
 	$LDFLAGS_STATIC
@@ -183,25 +133,24 @@ if [ "$(uname -s)" = 'FreeBSD' ]; then
 fi
 
 bundle() {
-	local bundle="$1"; shift
+	local bundle="$1"
+	shift
 	echo "---> Making bundle: $(basename "$bundle") (in $DEST)"
 	source "$SCRIPTDIR/make/$bundle" "$@"
 }
 
 main() {
+	bundle_dir="bundles"
+	if [ -n "${PREFIX}" ]; then
+		bundle_dir="${PREFIX}/${bundle_dir}"
+	fi
+
 	if [ -z "${KEEPBUNDLE-}" ]; then
-		echo "Removing bundles/"
-		rm -rf "bundles/*"
+		echo "Removing ${bundle_dir}/"
+		rm -rf "${bundle_dir}"/*
 		echo
 	fi
-	mkdir -p bundles
-
-	# Windows and symlinks don't get along well
-	if [ "$(go env GOHOSTOS)" != 'windows' ]; then
-		rm -f bundles/latest
-		# preserve latest symlink for backward compatibility
-		ln -sf . bundles/latest
-	fi
+	mkdir -p "${bundle_dir}"
 
 	if [ $# -lt 1 ]; then
 		bundles=(${DEFAULT_BUNDLES[@]})
@@ -209,7 +158,7 @@ main() {
 		bundles=($@)
 	fi
 	for bundle in ${bundles[@]}; do
-		export DEST="bundles/$(basename "$bundle")"
+		export DEST="${bundle_dir}/$(basename "$bundle")"
 		# Cygdrive paths don't play well with go build -o.
 		if [[ "$(uname -s)" == CYGWIN* ]]; then
 			export DEST="$(cygpath -mw "$DEST")"
